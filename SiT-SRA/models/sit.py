@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import math
-from timm.models.vision_transformer import PatchEmbed, Mlp
+from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
 
 from torch.nn.init import trunc_normal_
 
@@ -119,14 +119,9 @@ class CLSTokenEmbedder(nn.Module):
         self.norm = nn.LayerNorm(hidden_size)
 
     def forward(self, cls_condition, batch_size, device, dtype):
-        """Return a projected CLS token, or a zero placeholder when absent.
-
-        Visibility is deliberately handled by attention masking in ``SiT``.
-        A zero placeholder alone is not sufficient because patches could still
-        attend to it; the mask makes the absent case equivalent to no token.
-        """
+        """Return the projected clean CLS token used by the training-only path."""
         if cls_condition is None:
-            return torch.zeros(batch_size, self.projection.out_features, device=device, dtype=dtype)
+            raise ValueError("The CLS-token training model requires cls_condition")
 
         if cls_condition.ndim == 3 and cls_condition.shape[1] == 1:
             cls_condition = cls_condition[:, 0]
@@ -187,14 +182,22 @@ class SiTBlock(nn.Module):
     A SiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
     """
 
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, use_token_mask=False, **block_kwargs):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.attn = MaskedAttention(
-            hidden_size, num_heads=num_heads, qkv_bias=True,
-            qk_norm=block_kwargs["qk_norm"],
-            fused_attn=block_kwargs.get("fused_attn", True),
-        )
+        self.use_token_mask = use_token_mask
+        if use_token_mask:
+            self.attn = MaskedAttention(
+                hidden_size, num_heads=num_heads, qkv_bias=True,
+                qk_norm=block_kwargs["qk_norm"],
+                fused_attn=block_kwargs.get("fused_attn", True),
+            )
+        else:
+            self.attn = Attention(
+                hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=block_kwargs["qk_norm"]
+            )
+            if "fused_attn" in block_kwargs:
+                self.attn.fused_attn = block_kwargs["fused_attn"]
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
@@ -210,9 +213,12 @@ class SiTBlock(nn.Module):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.adaLN_modulation(c).chunk(6, dim=-1)
         )
-        x = x + gate_msa.unsqueeze(1) * self.attn(
-            modulate(self.norm1(x), shift_msa, scale_msa), key_mask=key_mask
-        )
+        attn_input = modulate(self.norm1(x), shift_msa, scale_msa)
+        if self.use_token_mask:
+            attn_output = self.attn(attn_input, key_mask=key_mask)
+        else:
+            attn_output = self.attn(attn_input)
+        x = x + gate_msa.unsqueeze(1) * attn_output
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
 
         return x
@@ -290,7 +296,10 @@ class SiT(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
         self.blocks = nn.ModuleList([
-            SiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, **block_kwargs) for _ in range(depth)
+            SiTBlock(
+                hidden_size, num_heads, mlp_ratio=mlp_ratio,
+                use_token_mask=cls_condition_dim > 0, **block_kwargs
+            ) for _ in range(depth)
         ])
         self.ap_head = SimpleHead(hidden_size, hidden_size)
         self.final_layer = FinalLayer(decoder_hidden_size, patch_size, self.out_channels)
@@ -359,8 +368,7 @@ class SiT(nn.Module):
         ad: number of layers to use for self-alignment
         cls_condition: optional clean image CLS features with shape (N, D)
         cls_present: optional per-sample bool mask controlling whether image
-            patches may attend to the first CLS token. False masks that token
-            out of every block's keys/values, equivalent to its absence.
+            patches may attend to the first CLS token during training.
         """
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
 
@@ -377,11 +385,7 @@ class SiT(nn.Module):
                 dtype=c.dtype,
             )
             x = torch.cat([cls_token.unsqueeze(1), x], dim=1)
-            if cls_condition is None:
-                if cls_present is not None:
-                    raise ValueError("cls_present cannot be set when cls_condition is None")
-                cls_present = torch.zeros(x.shape[0], device=x.device, dtype=torch.bool)
-            elif cls_present is None:
+            if cls_present is None:
                 cls_present = torch.ones(x.shape[0], device=x.device, dtype=torch.bool)
             elif cls_present.ndim != 1 or cls_present.shape[0] != x.shape[0]:
                 raise ValueError(

@@ -93,7 +93,7 @@ For privileged CLS training, raw images and VAE moments are read from the paired
 
 `L = L_flow + align_weight * D(h_student, h_teacher)`
 
-Sampling does not load DINO or provide CLS features; it uses a zero placeholder in the fixed CLS slot and masks that slot from every attention layer.
+Sampling does not load DINO or provide CLS features. It loads the original, token-free SiT and deliberately discards the CLS-token projector from the training checkpoint.
 
 Then this script will automatically create the folder in `exps` to save logs,samples, and checkpoints. You can adjust the following options:
 

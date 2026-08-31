@@ -43,12 +43,12 @@ class CLSTokenEmbedderTest(unittest.TestCase):
         cls_condition = torch.randn(3, 4)
 
         clean = embedder(cls_condition, 3, cls_condition.device, cls_condition.dtype)
-        placeholder = embedder(None, 3, cls_condition.device, cls_condition.dtype)
 
         self.assertEqual(clean.shape, (3, 5))
-        torch.testing.assert_close(placeholder, torch.zeros_like(placeholder))
+        with self.assertRaisesRegex(ValueError, "requires cls_condition"):
+            embedder(None, 3, cls_condition.device, cls_condition.dtype)
 
-    def test_sit_forward_without_cls_uses_null_path(self):
+    def test_original_sit_forward_has_no_cls_slot(self):
         model = SiT(
             input_size=4,
             patch_size=2,
@@ -56,7 +56,7 @@ class CLSTokenEmbedderTest(unittest.TestCase):
             decoder_hidden_size=32,
             depth=2,
             num_heads=4,
-            cls_condition_dim=6,
+            cls_condition_dim=0,
             qk_norm=False,
             fused_attn=False,
         ).eval()
@@ -74,12 +74,32 @@ class CLSTokenEmbedderTest(unittest.TestCase):
         finally:
             hook.remove()
 
-        # A zero, attention-masked CLS slot is prepended for inference, but
-        # the SRA feature and image output remain patch-token-only.
-        self.assertEqual(seen["token_shape"], (2, 5, 32))
+        self.assertEqual(seen["token_shape"], (2, 4, 32))
         self.assertEqual(output.shape, images.shape)
         self.assertEqual(features.shape, (2, 4, 32))
         torch.testing.assert_close(output_labels, labels)
+
+    def test_cls_training_weights_strictly_load_into_original_sit(self):
+        """The sampler must be able to use plain SiT after dropping CLS projector."""
+        common = dict(
+            input_size=4,
+            patch_size=2,
+            hidden_size=32,
+            decoder_hidden_size=32,
+            depth=2,
+            num_heads=4,
+            qk_norm=False,
+            fused_attn=False,
+        )
+        cls_training_model = SiT(cls_condition_dim=6, **common)
+        original_sit = SiT(cls_condition_dim=0, **common)
+        inference_state = {
+            key: value
+            for key, value in cls_training_model.state_dict().items()
+            if not key.startswith("cls_token_embedder.")
+        }
+
+        original_sit.load_state_dict(inference_state, strict=True)
 
     def test_masked_cls_is_invisible_to_patch_attention(self):
         attention = MaskedAttention(
