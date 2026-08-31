@@ -26,8 +26,8 @@ batch-size: 128
 num-workers: 8
 
 # Optimization: original SiT/SRA ImageNet-256 recipe
-epochs: 20
-max-train-steps: 100000
+epochs: 200
+max-train-steps: 400000
 mixed-precision: fp16
 gradient-accumulation-steps: 1
 learning-rate: 0.0001

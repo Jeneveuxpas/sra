@@ -38,15 +38,15 @@ class ProbabilityScheduleTest(unittest.TestCase):
 
 
 class CLSTokenEmbedderTest(unittest.TestCase):
-    def test_mask_selects_clean_or_null_per_sample(self):
+    def test_missing_cls_returns_sampling_placeholder(self):
         embedder = CLSTokenEmbedder(input_dim=4, hidden_size=5)
         cls_condition = torch.randn(3, 4)
 
         clean = embedder(cls_condition, 3, cls_condition.device, cls_condition.dtype)
+        placeholder = embedder(None, 3, cls_condition.device, cls_condition.dtype)
 
         self.assertEqual(clean.shape, (3, 5))
-        with self.assertRaisesRegex(ValueError, "requires cls_condition"):
-            embedder(None, 3, cls_condition.device, cls_condition.dtype)
+        torch.testing.assert_close(placeholder, torch.zeros_like(placeholder))
 
     def test_original_sit_forward_has_no_cls_slot(self):
         model = SiT(
@@ -100,6 +100,38 @@ class CLSTokenEmbedderTest(unittest.TestCase):
         }
 
         original_sit.load_state_dict(inference_state, strict=True)
+
+    def test_cls_off_matches_original_sit(self):
+        """A fully masked placeholder must reproduce the deployment model."""
+        common = dict(
+            input_size=4,
+            patch_size=2,
+            hidden_size=32,
+            decoder_hidden_size=32,
+            depth=2,
+            num_heads=4,
+            qk_norm=False,
+            fused_attn=False,
+        )
+        cls_training_model = SiT(cls_condition_dim=6, **common).eval()
+        original_sit = SiT(cls_condition_dim=0, **common).eval()
+        original_sit.load_state_dict(
+            {
+                key: value
+                for key, value in cls_training_model.state_dict().items()
+                if not key.startswith("cls_token_embedder.")
+            },
+            strict=True,
+        )
+        images = torch.randn(2, 4, 4, 4)
+        timesteps = torch.rand(2)
+        labels = torch.tensor([1, 2])
+
+        cls_off = cls_training_model(images, timesteps, labels, ad=1)
+        original = original_sit(images, timesteps, labels, ad=1)
+
+        for cls_off_value, original_value in zip(cls_off, original):
+            torch.testing.assert_close(cls_off_value, original_value, rtol=1e-5, atol=1e-6)
 
     def test_masked_cls_is_invisible_to_patch_attention(self):
         attention = MaskedAttention(
