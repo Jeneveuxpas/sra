@@ -20,7 +20,8 @@ SKIP_EVAL=false
 NUM_FID_SAMPLES="${NUM_FID_SAMPLES:-50000}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-64}"
 EVAL_NUM_STEPS="${EVAL_NUM_STEPS:-250}"
-CFG_SCALE="${CFG_SCALE:-1.8}"
+# Table 1 SiT-B/2 comparison is explicitly evaluated without CFG.
+CFG_SCALE="${CFG_SCALE:-1.0}"
 GUIDANCE_HIGH="${GUIDANCE_HIGH:-0.7}"
 MODE="${MODE:-sde}"
 VAE="${VAE:-ema}"
