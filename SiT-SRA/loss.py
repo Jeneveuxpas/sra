@@ -99,25 +99,26 @@ class SRALoss:
             images,
             teacher,
             labels,
-            cls_condition,
-            student_cls_probability,
+            cls_condition=None,
+            student_cls_probability=None,
             ):
 
-        if cls_condition is None:
-            raise ValueError("A clean CLS condition is required for the privileged teacher")
-        if cls_condition.shape[0] != images.shape[0]:
+        use_privileged_cls = cls_condition is not None
+        if use_privileged_cls and cls_condition.shape[0] != images.shape[0]:
             raise ValueError(
                 "CLS batch size must match the image batch size: "
                 f"{cls_condition.shape[0]} != {images.shape[0]}"
             )
-        if not 0 <= student_cls_probability <= 1:
+        if use_privileged_cls and (student_cls_probability is None or not 0 <= student_cls_probability <= 1):
             raise ValueError(
                 f"student_cls_probability must be in [0, 1], got {student_cls_probability}"
             )
 
-        student_cls_present = (
-            torch.rand(images.shape[0], device=images.device) < student_cls_probability
-        )
+        student_cls_present = None
+        if use_privileged_cls:
+            student_cls_present = (
+                torch.rand(images.shape[0], device=images.device) < student_cls_probability
+            )
 
         # sample timesteps
         if self.weighting == "uniform":
@@ -150,7 +151,7 @@ class SRALoss:
             time_input.flatten(),
             y=labels,
             ad=self.block_out_s,
-            cls_condition=cls_condition,
+            cls_condition=cls_condition if use_privileged_cls else None,
             cls_present=student_cls_present,
         )
 
@@ -163,14 +164,14 @@ class SRALoss:
         alpha_teacher, sigma_teacher, d_alpha_teacher, d_sigma_teacher = self.interpolant(time_input_teacher)
         teacher_input = alpha_teacher * images_t + sigma_teacher * noises_t
 
-        teacher_cls_present = torch.ones_like(student_cls_present)
+        teacher_cls_present = torch.ones_like(student_cls_present) if use_privileged_cls else None
         with torch.no_grad():
             xr_t = teacher(
                 teacher_input,
                 time_input_teacher.flatten(),
                 y=labels_teacher,
                 ad=self.block_out_t,
-                cls_condition=cls_condition,
+                cls_condition=cls_condition if use_privileged_cls else None,
                 cls_present=teacher_cls_present,
             )[1]
 

@@ -1,0 +1,49 @@
+# Baseline for reproducing the original released SiT-SRA training path.
+# It uses the same HF save_to_disk layout and latent-only reader as SIT:
+#   <data-dir>/imagenet-latents-sdvae-ft-mse-f8d4/
+# Labels are loaded from imagenet_train_labels.txt when present, otherwise from
+# the paired imagenet-latents-images/ dataset without decoding RGB images.
+
+output-dir: exps
+exp-name: sit-b2-sra-official-hf
+logging-dir: logs
+resume-ckpt: null
+sample-steps: 100000
+checkpoint-steps: 100000
+checkpoint-epochs: 200
+
+model: SiT-B/2
+num-classes: 1000
+resolution: 256
+data-dir: /dev/shm/data
+fused-attn: true
+qk-norm: false
+
+# Two processes x 128 = global batch size 256, matching the release recipe.
+batch-size: 128
+num-workers: 8
+epochs: 20
+max-train-steps: 100000
+mixed-precision: fp16
+gradient-accumulation-steps: 1
+learning-rate: 0.0001
+adam-beta1: 0.9
+adam-beta2: 0.999
+adam-weight-decay: 0.0
+adam-epsilon: 0.00000001
+max-grad-norm: 1.0
+ema-decay: 0.9999
+seed: 0
+
+# Table 1 best SiT-B/2 ablation: 3 -> 8, random time gap [0, 0.2), lambda=0.2.
+path-type: linear
+prediction: v
+weighting: uniform
+loss-type: sml1
+block-out-s: 3
+block-out-t: 8
+t-max: 0.2
+official-sra-schedule: false
+align-weight: 0.2
+cfg-prob: 0.1
+use-privileged-cls: false

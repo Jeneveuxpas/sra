@@ -59,6 +59,22 @@ The privileged-CLS SiT path uses the same HuggingFace `save_to_disk` layout as S
 Here we provide the training code for SiTs and DiTs.
 
 ##### 5.1.Training with SiT + SRA
+To reproduce the unmodified released SiT-SRA path with the same HuggingFace
+`save_to_disk` latent layout as `SIT`, run:
+
+```bash
+cd SiT-SRA
+accelerate launch --config_file configs/default.yaml train.py \
+  --config configs/sit-b2-sra-official-hf.yaml
+```
+
+This baseline does not load DINO or decode RGB images during training. It reads
+`imagenet-latents-sdvae-ft-mse-f8d4/`; labels come from
+`imagenet_train_labels.txt` when present, otherwise from the paired
+`imagenet-latents-images/` metadata, as in `SIT`.
+
+The separate config below enables the new privileged-CLS extension:
+
 The provided SiT-B/2 experiment config follows the original SRA paper settings
 (`3 -> 8` alignment, dynamic `[0, 0.2)` time gap, smooth-L1, and a global batch
 size of 256) and adds the privileged CLS schedule:

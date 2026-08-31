@@ -23,7 +23,7 @@ from transformers.optimization import get_scheduler
 from models.sit import SiT_models
 from loss import SRALoss, linear_cls_probability
 
-from dataset import HFImgLatentDataset
+from dataset import HFImgLatentDataset, HFLatentDataset
 from dino_cls import load_dino_cls_extractor
 from diffusers.models import AutoencoderKL
 
@@ -129,24 +129,23 @@ def main(args):
 
     block_kwargs = {"fused_attn": args.fused_attn, "qk_norm": args.qk_norm}
 
-    dino_cls_extractor = load_dino_cls_extractor(
-        args.dino_model_name,
-        args.resolution,
-        device,
-        accelerator,
-    )
-    if dino_cls_extractor.embed_dim != args.cls_dim:
-        raise ValueError(
-            f"DINO CLS dimension {dino_cls_extractor.embed_dim} does not match "
-            f"--cls-dim={args.cls_dim}"
+    dino_cls_extractor = None
+    if args.use_privileged_cls:
+        dino_cls_extractor = load_dino_cls_extractor(
+            args.dino_model_name, args.resolution, device, accelerator,
         )
+        if dino_cls_extractor.embed_dim != args.cls_dim:
+            raise ValueError(
+                f"DINO CLS dimension {dino_cls_extractor.embed_dim} does not match "
+                f"--cls-dim={args.cls_dim}"
+            )
 
     model = SiT_models[args.model](
         input_size=latent_size,
         num_classes=args.num_classes,
         use_cfg=(args.cfg_prob > 0),
         class_dropout_prob=args.cfg_prob,
-        cls_condition_dim=args.cls_dim,
+        cls_condition_dim=args.cls_dim if args.use_privileged_cls else 0,
         **block_kwargs
     )
 
@@ -188,11 +187,8 @@ def main(args):
 
 
     # Setup dataset:
-    train_dataset = HFImgLatentDataset(
-        "sdvae-ft-mse-f8d4",
-        args.data_dir,
-        split="train",
-    )
+    dataset_cls = HFImgLatentDataset if args.use_privileged_cls else HFLatentDataset
+    train_dataset = dataset_cls("sdvae-ft-mse-f8d4", args.data_dir, split="train")
 
 
     num_images = len(train_dataset)
@@ -254,7 +250,11 @@ def main(args):
 
     # Labels to condition the model with (feel free to change):
     sample_batch_size = 64 // accelerator.num_processes
-    _, gt_xs, gt_labels = next(iter(train_dataloader))
+    sample_batch = next(iter(train_dataloader))
+    if args.use_privileged_cls:
+        _, gt_xs, gt_labels = sample_batch
+    else:
+        gt_xs, gt_labels = sample_batch
     gt_xs = gt_xs[:sample_batch_size]
     gt_labels = gt_labels[:sample_batch_size]
     gt_xs = sample_posterior(
@@ -271,7 +271,12 @@ def main(args):
         last_epoch = epoch
 
         model.train()
-        for raw_image, images_l, y in train_dataloader:
+        for batch in train_dataloader:
+            if args.use_privileged_cls:
+                raw_image, images_l, y = batch
+            else:
+                images_l, y = batch
+                raw_image = None
             # save checkpoint (feel free to adjust the frequency)
             if (global_step % args.checkpoint_steps == 0) and global_step > 0:
                 accelerator.wait_for_everyone()
@@ -331,32 +336,32 @@ def main(args):
 
             x = images_l.to(device)
             y = y.to(device)
-            raw_image = raw_image.to(device)
             labels = y
 
             with torch.no_grad():
                 x = sample_posterior(x, latents_scale=latents_scale, latents_bias=latents_bias)
-                with accelerator.autocast():
-                    cls_condition = dino_cls_extractor(raw_image)
+                cls_condition = None
+                if args.use_privileged_cls:
+                    with accelerator.autocast():
+                        cls_condition = dino_cls_extractor(raw_image.to(device))
 
             with accelerator.accumulate(model):
-                cls_probability = linear_cls_probability(
-                    global_step,
-                    args.cls_prob_start,
-                    args.cls_prob_end,
-                    args.cls_prob_decay_steps,
-                )
-                gen_loss, align_loss, student_cls_present = loss_fn(
-                    model,
-                    x,
-                    ema,
-                    labels,
-                    cls_condition,
-                    cls_probability,
-                )
+                cls_probability = None
+                if args.use_privileged_cls:
+                    cls_probability = linear_cls_probability(
+                        global_step, args.cls_prob_start, args.cls_prob_end,
+                        args.cls_prob_decay_steps,
+                    )
+                loss_outputs = loss_fn(model, x, ema, labels, cls_condition, cls_probability)
+                gen_loss, align_loss, student_cls_present = loss_outputs
                 gen_loss_mean = gen_loss.mean()
                 align_loss_raw = align_loss.mean()
-                align_loss_mean = args.align_weight * align_loss_raw
+                if args.official_sra_schedule:
+                    decay_start, decay_duration = (149, 650) if args.resolution == 256 else (99, 300)
+                    decay_progress = ((epoch - decay_start) / decay_duration + 1) if epoch > decay_start else 1
+                    align_loss_mean = 2 * (0.1 ** decay_progress) * align_loss_raw
+                else:
+                    align_loss_mean = args.align_weight * align_loss_raw
 
                 # total loss
                 loss = gen_loss_mean + align_loss_mean
@@ -381,12 +386,13 @@ def main(args):
                 "gen_loss": accelerator.gather(gen_loss_mean).mean().detach().item(),
                 "align_loss": accelerator.gather(align_loss_mean).mean().detach().item(),
                 "align_loss_raw": accelerator.gather(align_loss_raw).mean().detach().item(),
-                "cls_probability": cls_probability,
-                "cls_present_rate": accelerator.gather(
-                    student_cls_present.float().mean().unsqueeze(0)
-                ).mean().detach().item(),
                 "epoch": epoch,
             }
+            if args.use_privileged_cls:
+                logs["cls_probability"] = cls_probability
+                logs["cls_present_rate"] = accelerator.gather(
+                    student_cls_present.float().mean().unsqueeze(0)
+                ).mean().detach().item()
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
             if global_step >= args.max_train_steps:
@@ -510,6 +516,12 @@ def parse_args(input_args=None):
                         , help="The max time-distance for teacher-student matching.")
     parser.add_argument("--align-weight", type=float, default=0.5,
                         help="Single weight applied to SRA alignment for every sample.")
+    parser.add_argument("--official-sra-schedule", action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help="Use the original release's epoch-based SRA alignment schedule.")
+    parser.add_argument("--use-privileged-cls", action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help="Enable the training-only DINO CLS teacher extension.")
     parser.add_argument("--cls-dim", type=int, default=768,
                         help="Dimension of the clean DINO CLS feature.")
     parser.add_argument("--dino-model-name", type=str, default="dinov2_vitb14",
@@ -579,11 +591,11 @@ def parse_args(input_args=None):
         parser.error(
             "--model must be one of: " + ", ".join(sorted(SiT_models))
         )
-    if args.cls_dim <= 0:
+    if args.use_privileged_cls and args.cls_dim <= 0:
         parser.error("--cls-dim must be positive for privileged CLS training")
-    if not 0 <= args.cls_prob_end <= args.cls_prob_start <= 1:
+    if args.use_privileged_cls and not 0 <= args.cls_prob_end <= args.cls_prob_start <= 1:
         parser.error("CLS probabilities must satisfy 0 <= end <= start <= 1")
-    if args.cls_prob_decay_steps <= 0:
+    if args.use_privileged_cls and args.cls_prob_decay_steps <= 0:
         parser.error("--cls-prob-decay-steps must be positive")
     if args.align_weight < 0:
         parser.error("--align-weight must be non-negative")

@@ -68,3 +68,69 @@ class HFImgLatentDataset(Dataset):
 
     def __repr__(self):
         return f"HFImgLatentDataset(n={len(self)})"
+
+
+class HFLatentDataset(Dataset):
+    """Latent-only ImageNet dataset in the same HF layout used by ``SIT``.
+
+    This is the appropriate data path for reproducing the original SiT-SRA
+    experiment: original SRA consumes only VAE moments and class labels, not
+    decoded RGB images or an external encoder feature.
+    """
+
+    PRECOMPUTED = HFImgLatentDataset.PRECOMPUTED
+
+    def __init__(self, vae_name, data_dir="/dev/shm/data", split="train"):
+        if load_from_disk is None:
+            raise ImportError(
+                "HFLatentDataset requires the 'datasets' package; "
+                "install the repository requirements first"
+            )
+        if vae_name not in self.PRECOMPUTED:
+            raise ValueError(f"VAE {vae_name} not found in {sorted(self.PRECOMPUTED)}")
+
+        split_dir = "val" if split == "val" else ""
+        latent_path = os.path.join(data_dir, f"imagenet-latents-{vae_name}", split_dir)
+        image_path = os.path.join(data_dir, "imagenet-latents-images", split_dir)
+        self.latent_dataset = load_from_disk(latent_path)
+        self._require_columns(self.latent_dataset, {"data"}, latent_path)
+
+        # Match SIT: labels are read from an optional text file, otherwise from
+        # the paired image dataset without returning or decoding image pixels.
+        label_path = os.path.join(data_dir, f"imagenet_{split}_labels.txt")
+        if os.path.exists(label_path):
+            self.labels = np.loadtxt(label_path, dtype=np.int64)
+        else:
+            image_dataset = load_from_disk(image_path)
+            self._require_columns(image_dataset, {"label"}, image_path)
+            if len(image_dataset) != len(self.latent_dataset):
+                raise ValueError(
+                    "Image and latent dataset lengths differ while recovering labels: "
+                    f"images={len(image_dataset)}, latents={len(self.latent_dataset)}"
+                )
+            self.labels = np.asarray(image_dataset["label"], dtype=np.int64)
+
+        if len(self.labels) != len(self.latent_dataset):
+            raise ValueError(
+                "Label and latent dataset lengths differ: "
+                f"labels={len(self.labels)}, latents={len(self.latent_dataset)}"
+            )
+
+    _require_columns = staticmethod(HFImgLatentDataset._require_columns)
+
+    def __getitem__(self, idx):
+        latent = torch.as_tensor(self.latent_dataset[idx]["data"])
+        if latent.ndim == 4 and latent.shape[0] == 1:
+            latent = latent.squeeze(0)
+        if latent.ndim != 3 or latent.shape[0] != 8:
+            raise ValueError(
+                "Expected VAE moments with shape [8, H, W] or [1, 8, H, W], "
+                f"got {tuple(latent.shape)} at index {idx}"
+            )
+        return latent, torch.tensor(self.labels[idx])
+
+    def __len__(self):
+        return len(self.latent_dataset)
+
+    def __repr__(self):
+        return f"HFLatentDataset(n={len(self)})"

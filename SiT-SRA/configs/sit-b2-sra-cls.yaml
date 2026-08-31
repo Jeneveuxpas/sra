@@ -52,6 +52,7 @@ block-out-t: 8
 t-max: 0.2
 align-weight: 0.2
 cfg-prob: 0.1
+use-privileged-cls: true
 
 # Privileged CLS extension. The 100K decay is scaled to the 400K SiT-B run;
 # student CLS probability remains at 0.1 for the final 300K steps.
