@@ -119,9 +119,17 @@ class CLSTokenEmbedder(nn.Module):
         self.norm = nn.LayerNorm(hidden_size)
 
     def forward(self, cls_condition, batch_size, device, dtype):
-        """Return the projected clean CLS token used by the training-only path."""
+        """Return a projected CLS token, or a masked-safe placeholder for sampling."""
         if cls_condition is None:
-            raise ValueError("The CLS-token training model requires cls_condition")
+            # Training-preview sampling has no clean source image.  SiT.forward
+            # pairs this placeholder with cls_present=False, so it is never a
+            # visible attention key/value and cannot affect image tokens.
+            return torch.zeros(
+                batch_size,
+                self.projection.out_features,
+                device=device,
+                dtype=dtype,
+            )
 
         if cls_condition.ndim == 3 and cls_condition.shape[1] == 1:
             cls_condition = cls_condition[:, 0]
@@ -378,6 +386,7 @@ class SiT(nn.Module):
         c = t_embed + y  # (N, D)
         key_mask = None
         if self.cls_token_embedder is not None:
+            cls_is_missing = cls_condition is None
             cls_token = self.cls_token_embedder(
                 cls_condition,
                 batch_size=x.shape[0],
@@ -386,13 +395,22 @@ class SiT(nn.Module):
             )
             x = torch.cat([cls_token.unsqueeze(1), x], dim=1)
             if cls_present is None:
-                cls_present = torch.ones(x.shape[0], device=x.device, dtype=torch.bool)
+                # No source image means no CLS information.  Keep its reserved
+                # token slot fully invisible for training-preview sampling.
+                cls_present = torch.zeros(
+                    x.shape[0], device=x.device, dtype=torch.bool
+                ) if cls_is_missing else torch.ones(
+                    x.shape[0], device=x.device, dtype=torch.bool
+                )
             elif cls_present.ndim != 1 or cls_present.shape[0] != x.shape[0]:
                 raise ValueError(
                     f"cls_present must have shape [{x.shape[0]}], got {tuple(cls_present.shape)}"
                 )
             else:
                 cls_present = cls_present.to(device=x.device, dtype=torch.bool)
+
+            if cls_is_missing and cls_present.any():
+                raise ValueError("cls_present cannot be true when cls_condition is None")
 
             # Shape [B, 1, 1, T] broadcasts across attention heads and query
             # tokens. For cls-off samples, no token can read token 0; in
