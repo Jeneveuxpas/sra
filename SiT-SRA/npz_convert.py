@@ -4,21 +4,57 @@ from tqdm import tqdm
 from PIL import Image
 import argparse
 import os
+import tempfile
+import zipfile
 
 def create_npz_from_sample_folder(sample_dir, num=50_000,save_path=None):
     """
-    Builds a single .npz file from a folder of .png samples.
+    Build an ADM-compatible ``arr_0`` NPZ without materializing all images in RAM.
+
+    A 50K ImageNet-256 array is about 9.8 GiB. ``np.stack`` followed by
+    ``np.savez`` transiently needs multiple copies of that array and can swap
+    indefinitely. We instead write a temporary NPY memmap one image at a time,
+    then add that NPY file to an uncompressed ZIP container (the NPZ format).
     """
-    samples = []
-    for i in tqdm(range(num), desc="Building .npz file from samples"):
-        sample_pil = Image.open(f"{sample_dir}/{i:06d}.png")
-        sample_np = np.asarray(sample_pil).astype(np.uint8)
-        samples.append(sample_np)
-    samples = np.stack(samples)
-    assert samples.shape == (num, samples.shape[1], samples.shape[2], 3)
     npz_path = save_path if save_path else f"{sample_dir}.npz"
-    np.savez(npz_path, arr_0=samples)
-    print(f"Saved .npz file to {npz_path} [shape={samples.shape}].")
+    output_dir = os.path.dirname(os.path.abspath(npz_path)) or "."
+    with Image.open(f"{sample_dir}/000000.png") as first_image:
+        first = np.asarray(first_image.convert("RGB"), dtype=np.uint8)
+    height, width, channels = first.shape
+    expected_shape = (num, height, width, channels)
+
+    fd, tmp_npy_path = tempfile.mkstemp(
+        prefix=".npz_convert_", suffix=".npy", dir=output_dir
+    )
+    os.close(fd)
+    tmp_npz_path = f"{npz_path}.tmp"
+    try:
+        samples = np.lib.format.open_memmap(
+            tmp_npy_path, mode="w+", dtype=np.uint8, shape=expected_shape
+        )
+        for i in tqdm(range(num), desc="Writing images to temporary NPY"):
+            with Image.open(f"{sample_dir}/{i:06d}.png") as sample_pil:
+                sample = np.asarray(sample_pil.convert("RGB"), dtype=np.uint8)
+            if sample.shape != (height, width, channels):
+                raise ValueError(
+                    f"Sample {i:06d} has shape {sample.shape}; expected "
+                    f"{(height, width, channels)}"
+                )
+            samples[i] = sample
+        samples.flush()
+        del samples
+
+        print("Packing NPZ from temporary NPY (disk streaming, no large RAM allocation)...")
+        with zipfile.ZipFile(tmp_npz_path, mode="w", compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
+            archive.write(tmp_npy_path, arcname="arr_0.npy")
+        os.replace(tmp_npz_path, npz_path)
+    finally:
+        if os.path.exists(tmp_npy_path):
+            os.remove(tmp_npy_path)
+        if os.path.exists(tmp_npz_path):
+            os.remove(tmp_npz_path)
+
+    print(f"Saved .npz file to {npz_path} [shape={expected_shape}].")
     return npz_path
 
 if __name__ == "__main__":

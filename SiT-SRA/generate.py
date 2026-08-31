@@ -26,7 +26,7 @@ from samplers import euler_sampler, euler_maruyama_sampler
 
 def infer_cls_condition_dim(state_dict):
     """Infer privileged CLS input size while keeping old SRA checkpoints loadable."""
-    suffix = "cls_embedder.projection.weight"
+    suffix = "cls_token_embedder.projection.weight"
     matching_keys = [key for key in state_dict if key.endswith(suffix)]
     if not matching_keys:
         return 0

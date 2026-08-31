@@ -10,7 +10,7 @@ from PIL import Image
 from dataset import HFImgLatentDataset
 from dino_cls import DINOCLSExtractor
 from loss import SRALoss, linear_cls_probability
-from models.sit import CLSConditionEmbedder, SiT
+from models.sit import CLSTokenEmbedder, MaskedAttention, SiT
 
 
 class RecordingModel(nn.Module):
@@ -37,19 +37,16 @@ class ProbabilityScheduleTest(unittest.TestCase):
         self.assertEqual(linear_cls_probability(1000, 1.0, 0.2, 100), 0.2)
 
 
-class CLSConditionEmbedderTest(unittest.TestCase):
+class CLSTokenEmbedderTest(unittest.TestCase):
     def test_mask_selects_clean_or_null_per_sample(self):
-        embedder = CLSConditionEmbedder(input_dim=4, hidden_size=5)
+        embedder = CLSTokenEmbedder(input_dim=4, hidden_size=5)
         cls_condition = torch.randn(3, 4)
-        mask = torch.tensor([True, False, True])
 
-        clean = embedder(cls_condition, None, 3, cls_condition.device, cls_condition.dtype)
-        null = embedder(None, None, 3, cls_condition.device, cls_condition.dtype)
-        mixed = embedder(cls_condition, mask, 3, cls_condition.device, cls_condition.dtype)
+        clean = embedder(cls_condition, 3, cls_condition.device, cls_condition.dtype)
+        placeholder = embedder(None, 3, cls_condition.device, cls_condition.dtype)
 
-        torch.testing.assert_close(mixed[0], clean[0])
-        torch.testing.assert_close(mixed[1], null[1])
-        torch.testing.assert_close(mixed[2], clean[2])
+        self.assertEqual(clean.shape, (3, 5))
+        torch.testing.assert_close(placeholder, torch.zeros_like(placeholder))
 
     def test_sit_forward_without_cls_uses_null_path(self):
         model = SiT(
@@ -66,12 +63,37 @@ class CLSConditionEmbedderTest(unittest.TestCase):
         images = torch.randn(2, 4, 4, 4)
         timesteps = torch.rand(2)
         labels = torch.tensor([1, 2])
+        seen = {}
 
-        output, features, output_labels = model(images, timesteps, labels, ad=1)
+        def record_block_input(_module, inputs):
+            seen["token_shape"] = inputs[0].shape
 
+        hook = model.blocks[0].register_forward_pre_hook(record_block_input)
+        try:
+            output, features, output_labels = model(images, timesteps, labels, ad=1)
+        finally:
+            hook.remove()
+
+        # A zero, attention-masked CLS slot is prepended for inference, but
+        # the SRA feature and image output remain patch-token-only.
+        self.assertEqual(seen["token_shape"], (2, 5, 32))
         self.assertEqual(output.shape, images.shape)
         self.assertEqual(features.shape, (2, 4, 32))
         torch.testing.assert_close(output_labels, labels)
+
+    def test_masked_cls_is_invisible_to_patch_attention(self):
+        attention = MaskedAttention(
+            dim=8, num_heads=2, qk_norm=False, fused_attn=False
+        ).eval()
+        cls = torch.randn(2, 1, 8)
+        patches = torch.randn(2, 4, 8)
+        key_mask = torch.zeros(2, 1, 1, 5)
+        key_mask[:, :, :, 0] = float("-inf")
+
+        without_cls = attention(patches)
+        with_masked_cls = attention(torch.cat([cls, patches], dim=1), key_mask=key_mask)
+
+        torch.testing.assert_close(with_masked_cls[:, 1:], without_cls)
 
     def test_tiny_sit_runs_privileged_alignment_end_to_end(self):
         student = SiT(

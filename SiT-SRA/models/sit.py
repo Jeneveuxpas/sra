@@ -8,9 +8,10 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import math
-from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
+from timm.models.vision_transformer import PatchEmbed, Mlp
 
 from torch.nn.init import trunc_normal_
 
@@ -108,24 +109,24 @@ class LabelEmbedder(nn.Module):
         return embeddings, labels
 
 
-class CLSConditionEmbedder(nn.Module):
-    """Projects a clean image CLS feature or substitutes a learned null condition."""
+class CLSTokenEmbedder(nn.Module):
+    """Projects a clean CLS feature into the reserved first sequence-token slot."""
 
     def __init__(self, input_dim, hidden_size):
         super().__init__()
         self.input_dim = input_dim
         self.projection = nn.Linear(input_dim, hidden_size)
         self.norm = nn.LayerNorm(hidden_size)
-        self.null_embedding = nn.Parameter(torch.zeros(hidden_size))
 
-    def forward(self, cls_condition, cls_present, batch_size, device, dtype):
-        null_condition = self.null_embedding.to(device=device, dtype=dtype)
-        null_condition = null_condition.unsqueeze(0).expand(batch_size, -1)
+    def forward(self, cls_condition, batch_size, device, dtype):
+        """Return a projected CLS token, or a zero placeholder when absent.
 
+        Visibility is deliberately handled by attention masking in ``SiT``.
+        A zero placeholder alone is not sufficient because patches could still
+        attend to it; the mask makes the absent case equivalent to no token.
+        """
         if cls_condition is None:
-            if cls_present is not None:
-                raise ValueError("cls_present cannot be set when cls_condition is None")
-            return null_condition
+            return torch.zeros(batch_size, self.projection.out_features, device=device, dtype=dtype)
 
         if cls_condition.ndim == 3 and cls_condition.shape[1] == 1:
             cls_condition = cls_condition[:, 0]
@@ -140,21 +141,46 @@ class CLSConditionEmbedder(nn.Module):
             )
 
         cls_condition = cls_condition.to(device=device, dtype=dtype)
-        clean_condition = self.norm(self.projection(cls_condition))
-        if cls_present is None:
-            return clean_condition
-
-        if cls_present.ndim != 1 or cls_present.shape[0] != batch_size:
-            raise ValueError(
-                f"cls_present must have shape [{batch_size}], got {tuple(cls_present.shape)}"
-            )
-        cls_present = cls_present.to(device=device, dtype=torch.bool)
-        return torch.where(cls_present.unsqueeze(1), clean_condition, null_condition)
+        return self.norm(self.projection(cls_condition))
 
 
 #################################################################################
 #                                 Core SiT Model                                #
 #################################################################################
+
+class MaskedAttention(nn.Module):
+    """SiT self-attention with a broadcastable per-sample key/value mask."""
+
+    def __init__(self, dim, num_heads=8, qkv_bias=True, qk_norm=False, fused_attn=True):
+        super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}")
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.fused_attn = fused_attn
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.q_norm = nn.LayerNorm(self.head_dim) if qk_norm else nn.Identity()
+        self.k_norm = nn.LayerNorm(self.head_dim) if qk_norm else nn.Identity()
+        self.proj = nn.Linear(dim, dim)
+
+    def forward(self, x, key_mask=None):
+        batch_size, num_tokens, channels = x.shape
+        qkv = self.qkv(x).reshape(batch_size, num_tokens, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        q, k = self.q_norm(q), self.k_norm(k)
+
+        if self.fused_attn:
+            x = F.scaled_dot_product_attention(q, k, v, attn_mask=key_mask, dropout_p=0.0)
+        else:
+            attn = (q * self.scale) @ k.transpose(-2, -1)
+            if key_mask is not None:
+                attn = attn + key_mask
+            x = attn.softmax(dim=-1) @ v
+        x = x.transpose(1, 2).reshape(batch_size, num_tokens, channels)
+        return self.proj(x)
+
 
 class SiTBlock(nn.Module):
     """
@@ -164,11 +190,11 @@ class SiTBlock(nn.Module):
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.attn = Attention(
-            hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=block_kwargs["qk_norm"]
+        self.attn = MaskedAttention(
+            hidden_size, num_heads=num_heads, qkv_bias=True,
+            qk_norm=block_kwargs["qk_norm"],
+            fused_attn=block_kwargs.get("fused_attn", True),
         )
-        if "fused_attn" in block_kwargs.keys():
-            self.attn.fused_attn = block_kwargs["fused_attn"]
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
@@ -180,11 +206,13 @@ class SiTBlock(nn.Module):
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         )
 
-    def forward(self, x, c):
+    def forward(self, x, c, key_mask=None):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.adaLN_modulation(c).chunk(6, dim=-1)
         )
-        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        x = x + gate_msa.unsqueeze(1) * self.attn(
+            modulate(self.norm1(x), shift_msa, scale_msa), key_mask=key_mask
+        )
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
 
         return x
@@ -253,8 +281,8 @@ class SiT(nn.Module):
         )
         self.t_embedder = TimestepEmbedder(hidden_size)  # timestep embedding type
         self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
-        self.cls_embedder = (
-            CLSConditionEmbedder(cls_condition_dim, hidden_size)
+        self.cls_token_embedder = (
+            CLSTokenEmbedder(cls_condition_dim, hidden_size)
             if cls_condition_dim > 0 else None
         )
         num_patches = self.x_embedder.num_patches
@@ -330,7 +358,9 @@ class SiT(nn.Module):
         y: (N,) tensor of class labels
         ad: number of layers to use for self-alignment
         cls_condition: optional clean image CLS features with shape (N, D)
-        cls_present: optional per-sample bool mask selecting clean versus null CLS
+        cls_present: optional per-sample bool mask controlling whether image
+            patches may attend to the first CLS token. False masks that token
+            out of every block's keys/values, equivalent to its absence.
         """
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
 
@@ -338,24 +368,48 @@ class SiT(nn.Module):
         t_embed = self.t_embedder(t)  # (N, D)
         y, labels_train = self.y_embedder(y, self.training)  # (N, D)
         c = t_embed + y  # (N, D)
-        if self.cls_embedder is not None:
-            c = c + self.cls_embedder(
+        key_mask = None
+        if self.cls_token_embedder is not None:
+            cls_token = self.cls_token_embedder(
                 cls_condition,
-                cls_present,
                 batch_size=x.shape[0],
                 device=c.device,
                 dtype=c.dtype,
             )
+            x = torch.cat([cls_token.unsqueeze(1), x], dim=1)
+            if cls_condition is None:
+                if cls_present is not None:
+                    raise ValueError("cls_present cannot be set when cls_condition is None")
+                cls_present = torch.zeros(x.shape[0], device=x.device, dtype=torch.bool)
+            elif cls_present is None:
+                cls_present = torch.ones(x.shape[0], device=x.device, dtype=torch.bool)
+            elif cls_present.ndim != 1 or cls_present.shape[0] != x.shape[0]:
+                raise ValueError(
+                    f"cls_present must have shape [{x.shape[0]}], got {tuple(cls_present.shape)}"
+                )
+            else:
+                cls_present = cls_present.to(device=x.device, dtype=torch.bool)
+
+            # Shape [B, 1, 1, T] broadcasts across attention heads and query
+            # tokens. For cls-off samples, no token can read token 0; in
+            # particular, image patches cannot read its key/value.
+            key_mask = torch.zeros(x.shape[0], 1, 1, x.shape[1], device=x.device, dtype=x.dtype)
+            key_mask[~cls_present, :, :, 0] = float("-inf")
         elif cls_condition is not None or cls_present is not None:
             raise ValueError("CLS conditioning is disabled because cls_condition_dim is 0")
 
         for i, block in enumerate(self.blocks):
-            x = block(x, c)  # (N, T, D)
+            x = block(x, c, key_mask=key_mask)
             if (i + 1) == ad:
+                # SRA aligns image representations only; the extra CLS/null
+                # token participates in attention but is never an alignment target.
+                image_tokens = x[:, 1:] if self.cls_token_embedder is not None else x
                 if self.training:
-                    xr = self.ap_head(x)
+                    xr = self.ap_head(image_tokens)
                 else:
-                    xr = x
+                    xr = image_tokens
+        if self.cls_token_embedder is not None:
+            x = x[:, 1:]
         x = self.final_layer(x, c)  # (N, T, patch_size ** 2 * out_channels)
         x = self.unpatchify(x)  # (N, out_channels, H, W)
 

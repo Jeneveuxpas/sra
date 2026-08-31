@@ -89,11 +89,11 @@ All training hyperparameters are in `configs/sit-b2-sra-cls.yaml`. Explicit CLI
 arguments override YAML values, for example `--batch-size 16` or
 `--resume-ckpt /path/to/checkpoint.pt`.
 
-For privileged CLS training, raw images and VAE moments are read from the paired HuggingFace datasets above. A frozen DINOv2-B extracts clean CLS online. The EMA teacher always receives that feature; each student sample receives it with the scheduled probability, otherwise it receives a learned null condition. The probability decays linearly from `--cls-prob-start` to `--cls-prob-end`, then stays at the end value. Alignment uses one coefficient for all samples:
+For privileged CLS training, raw images and VAE moments are read from the paired HuggingFace datasets above. A frozen DINOv2-B extracts clean CLS online. Its projected representation occupies the first sequence-token slot before the image patch tokens. The EMA teacher always allows patches to attend to that token; each student sample allows it with the scheduled probability, otherwise every block masks the CLS slot from its attention keys/values. The probability decays linearly from `--cls-prob-start` to `--cls-prob-end`, then stays at the end value. Alignment compares image patch tokens only and uses one coefficient for all samples:
 
 `L = L_flow + align_weight * D(h_student, h_teacher)`
 
-Sampling does not load DINO or provide CLS features; it always uses the learned null condition.
+Sampling does not load DINO or provide CLS features; it uses a zero placeholder in the fixed CLS slot and masks that slot from every attention layer.
 
 Then this script will automatically create the folder in `exps` to save logs,samples, and checkpoints. You can adjust the following options:
 
