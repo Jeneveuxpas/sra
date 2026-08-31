@@ -2,6 +2,8 @@ torch==2.5.1
 torchvision==0.20.1
 diffusers
 transformers
+datasets
+PyYAML
 timm
 tqdm
 accelerate

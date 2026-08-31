@@ -48,28 +48,36 @@ pip install -r requirements.txt
 Currently, we provide experiments for [ImageNet](https://www.kaggle.com/competitions/imagenet-object-localization-challenge/data). You can place the data that you want and can specify it via `--data-dir` arguments in training scripts. \
 Note that we preprocess the data for faster training. Please refer to [preprocessing guide](https://github.com/vvvvvjdy/SRA/tree/main/preprocessing) for detailed guidance.
 
+The privileged-CLS SiT path uses the same HuggingFace `save_to_disk` layout as SIT. By default it reads these paired datasets by index:
+
+```text
+/dev/shm/data/imagenet-latents-images/
+/dev/shm/data/imagenet-latents-sdvae-ft-mse-f8d4/
+```
+
 ### 🔥5.Training
 Here we provide the training code for SiTs and DiTs.
 
 ##### 5.1.Training with SiT + SRA
+The provided SiT-B/2 experiment config follows the original SRA paper settings
+(`3 -> 8` alignment, dynamic `[0, 0.2)` time gap, smooth-L1, and a global batch
+size of 256) and adds the privileged CLS schedule:
+
 ```bash
 cd SiT-SRA
 accelerate launch --config_file configs/default.yaml train.py \
-  --mixed-precision="fp16" \
-  --seed=0 \
-  --path-type="linear" \
-  --prediction="v" \
-  --resolution=256 \
-  --batch-size=32 \
-  --weighting="uniform" \
-  --model="SiT-XL/2" \
-  --block-out-s=8 \
-  --block-out-t=20 \
-  --t-max=0.2 \
-  --output-dir="exps" \
-  --exp-name="sitxl-ab820-t0.2-res256" \
-  --data-dir=[YOUR_DATA_PATH]
+  --config configs/sit-b2-sra-cls.yaml
 ```
+
+All training hyperparameters are in `configs/sit-b2-sra-cls.yaml`. Explicit CLI
+arguments override YAML values, for example `--batch-size 16` or
+`--resume-ckpt /path/to/checkpoint.pt`.
+
+For privileged CLS training, raw images and VAE moments are read from the paired HuggingFace datasets above. A frozen DINOv2-B extracts clean CLS online. The EMA teacher always receives that feature; each student sample receives it with the scheduled probability, otherwise it receives a learned null condition. The probability decays linearly from `--cls-prob-start` to `--cls-prob-end`, then stays at the end value. Alignment uses one coefficient for all samples:
+
+`L = L_flow + align_weight * D(h_student, h_teacher)`
+
+Sampling does not load DINO or provide CLS features; it always uses the learned null condition.
 
 Then this script will automatically create the folder in `exps` to save logs,samples, and checkpoints. You can adjust the following options:
 
@@ -77,6 +85,8 @@ Then this script will automatically create the folder in `exps` to save logs,sam
 - `--block-out-s`: Student's output block layer for alignment
 - `--block-out-t`: Teacher's output block layer for alignment
 - `--t-max`: Maximum time interval for alignment (we only use dynamic interval here)
+- `--align-weight`: One alignment weight shared by CLS-on and CLS-off student samples
+- `--cls-prob-start`, `--cls-prob-end`, `--cls-prob-decay-steps`: Student clean-CLS probability schedule
 - `--output-dir`: Any directory that you want to save checkpoints, samples, and logs
 - `--exp-name`: Any string name (the folder will be created under `output-dir`)
 - `--batch-size`: The local batch size (by default we use 1 node of 8 GPUs), you need to adjust this value according to your GPU number to make total batch size of 256
@@ -165,4 +175,3 @@ If you find SRA useful, please kindly cite our paper:
   year={2025}
 }
 ```
-

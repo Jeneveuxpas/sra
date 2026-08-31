@@ -4,7 +4,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from torch.nn.functional import smooth_l1_loss
-import random
 
 # simple loss function
 class Simpleloss(nn.Module):
@@ -37,6 +36,20 @@ def sum_flat(x):
     Take the mean over all non-batch dimensions.
     """
     return torch.sum(x, dim=list(range(1, len(x.size()))))
+
+
+def linear_cls_probability(step, start, end, decay_steps):
+    """Linearly decay the student CLS probability and hold it at ``end``."""
+    if not 0 <= end <= start <= 1:
+        raise ValueError(f"Expected 0 <= end <= start <= 1, got start={start}, end={end}")
+    if decay_steps <= 0:
+        raise ValueError(f"decay_steps must be positive, got {decay_steps}")
+    if step <= 0:
+        return start
+    if step >= decay_steps:
+        return end
+    progress = step / decay_steps
+    return start + (end - start) * progress
 
 
 class SRALoss:
@@ -80,7 +93,31 @@ class SRALoss:
 
         return alpha_t, sigma_t, d_alpha_t, d_sigma_t
 
-    def __call__(self, model, images,teacher,labels):
+    def __call__(
+            self,
+            model,
+            images,
+            teacher,
+            labels,
+            cls_condition,
+            student_cls_probability,
+            ):
+
+        if cls_condition is None:
+            raise ValueError("A clean CLS condition is required for the privileged teacher")
+        if cls_condition.shape[0] != images.shape[0]:
+            raise ValueError(
+                "CLS batch size must match the image batch size: "
+                f"{cls_condition.shape[0]} != {images.shape[0]}"
+            )
+        if not 0 <= student_cls_probability <= 1:
+            raise ValueError(
+                f"student_cls_probability must be in [0, 1], got {student_cls_probability}"
+            )
+
+        student_cls_present = (
+            torch.rand(images.shape[0], device=images.device) < student_cls_probability
+        )
 
         # sample timesteps
         if self.weighting == "uniform":
@@ -108,7 +145,14 @@ class SRALoss:
         else:
             raise NotImplementedError()
 
-        model_output_gen, xr, labels_train = model(model_input, time_input.flatten(), y=labels,ad=self.block_out_s)
+        model_output_gen, xr, labels_train = model(
+            model_input,
+            time_input.flatten(),
+            y=labels,
+            ad=self.block_out_s,
+            cls_condition=cls_condition,
+            cls_present=student_cls_present,
+        )
 
         # teacher
         time_input_teacher = torch.clamp(time_input_teacher, 0, 1)
@@ -119,10 +163,19 @@ class SRALoss:
         alpha_teacher, sigma_teacher, d_alpha_teacher, d_sigma_teacher = self.interpolant(time_input_teacher)
         teacher_input = alpha_teacher * images_t + sigma_teacher * noises_t
 
-        xr_t = teacher(teacher_input, time_input_teacher.flatten(), y=labels_teacher, ad=self.block_out_t)[1]
+        teacher_cls_present = torch.ones_like(student_cls_present)
+        with torch.no_grad():
+            xr_t = teacher(
+                teacher_input,
+                time_input_teacher.flatten(),
+                y=labels_teacher,
+                ad=self.block_out_t,
+                cls_condition=cls_condition,
+                cls_present=teacher_cls_present,
+            )[1]
 
         # loss
         denoising_loss = mean_flat((model_output_gen - model_target) ** 2)
         align_loss = self.criterion(xr, xr_t, loss_type=self.loss_type)
 
-        return denoising_loss, align_loss
+        return denoising_loss, align_loss, student_cls_present

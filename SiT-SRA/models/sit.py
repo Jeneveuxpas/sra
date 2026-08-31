@@ -108,6 +108,50 @@ class LabelEmbedder(nn.Module):
         return embeddings, labels
 
 
+class CLSConditionEmbedder(nn.Module):
+    """Projects a clean image CLS feature or substitutes a learned null condition."""
+
+    def __init__(self, input_dim, hidden_size):
+        super().__init__()
+        self.input_dim = input_dim
+        self.projection = nn.Linear(input_dim, hidden_size)
+        self.norm = nn.LayerNorm(hidden_size)
+        self.null_embedding = nn.Parameter(torch.zeros(hidden_size))
+
+    def forward(self, cls_condition, cls_present, batch_size, device, dtype):
+        null_condition = self.null_embedding.to(device=device, dtype=dtype)
+        null_condition = null_condition.unsqueeze(0).expand(batch_size, -1)
+
+        if cls_condition is None:
+            if cls_present is not None:
+                raise ValueError("cls_present cannot be set when cls_condition is None")
+            return null_condition
+
+        if cls_condition.ndim == 3 and cls_condition.shape[1] == 1:
+            cls_condition = cls_condition[:, 0]
+        if cls_condition.ndim != 2:
+            raise ValueError(
+                f"cls_condition must have shape [B, {self.input_dim}], got {tuple(cls_condition.shape)}"
+            )
+        if cls_condition.shape != (batch_size, self.input_dim):
+            raise ValueError(
+                f"cls_condition must have shape [{batch_size}, {self.input_dim}], "
+                f"got {tuple(cls_condition.shape)}"
+            )
+
+        cls_condition = cls_condition.to(device=device, dtype=dtype)
+        clean_condition = self.norm(self.projection(cls_condition))
+        if cls_present is None:
+            return clean_condition
+
+        if cls_present.ndim != 1 or cls_present.shape[0] != batch_size:
+            raise ValueError(
+                f"cls_present must have shape [{batch_size}], got {tuple(cls_present.shape)}"
+            )
+        cls_present = cls_present.to(device=device, dtype=torch.bool)
+        return torch.where(cls_present.unsqueeze(1), clean_condition, null_condition)
+
+
 #################################################################################
 #                                 Core SiT Model                                #
 #################################################################################
@@ -187,6 +231,7 @@ class SiT(nn.Module):
             class_dropout_prob=0.1,
             num_classes=1000,
             use_cfg=False,
+            cls_condition_dim=0,
             **block_kwargs  # fused_attn
     ):
         super().__init__()
@@ -197,6 +242,10 @@ class SiT(nn.Module):
         self.num_heads = num_heads
         self.use_cfg = use_cfg
         self.num_classes = num_classes
+        self.cls_condition_dim = cls_condition_dim
+
+        if cls_condition_dim < 0:
+            raise ValueError(f"cls_condition_dim must be non-negative, got {cls_condition_dim}")
 
 
         self.x_embedder = PatchEmbed(
@@ -204,6 +253,10 @@ class SiT(nn.Module):
         )
         self.t_embedder = TimestepEmbedder(hidden_size)  # timestep embedding type
         self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+        self.cls_embedder = (
+            CLSConditionEmbedder(cls_condition_dim, hidden_size)
+            if cls_condition_dim > 0 else None
+        )
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
@@ -269,13 +322,15 @@ class SiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def forward(self, x, t, y, ad=4):
+    def forward(self, x, t, y, ad=4, cls_condition=None, cls_present=None):
         """
         Forward pass of SiT.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
         ad: number of layers to use for self-alignment
+        cls_condition: optional clean image CLS features with shape (N, D)
+        cls_present: optional per-sample bool mask selecting clean versus null CLS
         """
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
 
@@ -283,6 +338,16 @@ class SiT(nn.Module):
         t_embed = self.t_embedder(t)  # (N, D)
         y, labels_train = self.y_embedder(y, self.training)  # (N, D)
         c = t_embed + y  # (N, D)
+        if self.cls_embedder is not None:
+            c = c + self.cls_embedder(
+                cls_condition,
+                cls_present,
+                batch_size=x.shape[0],
+                device=c.device,
+                dtype=c.dtype,
+            )
+        elif cls_condition is not None or cls_present is not None:
+            raise ValueError("CLS conditioning is disabled because cls_condition_dim is 0")
 
         for i, block in enumerate(self.blocks):
             x = block(x, c)  # (N, T, D)
@@ -410,4 +475,3 @@ SiT_models = {
     'SiT-B/2': SiT_B_2, 'SiT-B/4': SiT_B_4, 'SiT-B/8': SiT_B_8,
     'SiT-S/2': SiT_S_2, 'SiT-S/4': SiT_S_4, 'SiT-S/8': SiT_S_8,
 }
-

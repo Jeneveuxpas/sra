@@ -24,6 +24,17 @@ import argparse
 from samplers import euler_sampler, euler_maruyama_sampler
 
 
+def infer_cls_condition_dim(state_dict):
+    """Infer privileged CLS input size while keeping old SRA checkpoints loadable."""
+    suffix = "cls_embedder.projection.weight"
+    matching_keys = [key for key in state_dict if key.endswith(suffix)]
+    if not matching_keys:
+        return 0
+    if len(matching_keys) != 1:
+        raise ValueError(f"Ambiguous CLS projection keys in checkpoint: {matching_keys}")
+    return state_dict[matching_keys[0]].shape[1]
+
+
 
 
 
@@ -43,6 +54,20 @@ def main(args):
 
     print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
 
+    # Load checkpoint first so CLS conditioning can be inferred for new and legacy models.
+    ckpt_path = args.ckpt
+    if ckpt_path is None:
+        raise ValueError("ckpt_path is required!")
+    checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    state_dict = checkpoint['ema'] if isinstance(checkpoint, dict) and 'ema' in checkpoint else checkpoint
+    checkpoint_cls_dim = infer_cls_condition_dim(state_dict)
+    if args.cls_dim is not None and args.cls_dim != checkpoint_cls_dim:
+        raise ValueError(
+            f"--cls-dim={args.cls_dim} does not match checkpoint CLS dimension "
+            f"{checkpoint_cls_dim}"
+        )
+    cls_dim = checkpoint_cls_dim if args.cls_dim is None else args.cls_dim
+
     # Load model:
     block_kwargs = {"fused_attn": args.fused_attn, "qk_norm": args.qk_norm}
     latent_size = args.resolution // 8
@@ -50,20 +75,9 @@ def main(args):
         input_size=latent_size,
         num_classes=args.num_classes,
         use_cfg= args.cfg_scale > 1.0,
+        cls_condition_dim=cls_dim,
         **block_kwargs
     ).to(device)
-
-
-
-    # ckpt_path is required!
-    ckpt_path = args.ckpt
-    if ckpt_path is None:
-        raise ValueError("ckpt_path is required!")
-    else:
-        try:
-            state_dict = torch.load(ckpt_path, map_location=f'cuda:{device}')['ema']
-        except:
-            state_dict = torch.load(ckpt_path, map_location=f'cuda:{device}')
 
     model.load_state_dict(state_dict)
     print(f"{rank} loaded model from {ckpt_path}")
@@ -177,6 +191,12 @@ if __name__ == "__main__":
     parser.add_argument("--resolution", type=int, choices=[256, 512], default=256)
     parser.add_argument("--fused-attn", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--qk-norm", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--cls-dim",
+        type=int,
+        default=None,
+        help="Optional CLS dimension check; inferred from the checkpoint by default.",
+    )
 
     # vae
     parser.add_argument("--vae",  type=str, choices=["ema", "mse"], default="ema")

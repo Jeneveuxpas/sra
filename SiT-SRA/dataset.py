@@ -1,54 +1,70 @@
 import os
-import json
 
+import numpy as np
 import torch
 from torch.utils.data import Dataset
-import numpy as np
 
-from PIL import Image
-import PIL.Image
 try:
-    import pyspng
+    from datasets import load_from_disk
 except ImportError:
-    pyspng = None
+    load_from_disk = None
 
 
-class CustomDataset(Dataset):
-    def __init__(self, data_dir,num_classes=1000):
-        PIL.Image.init()
-        supported_ext = PIL.Image.EXTENSION.keys() | {'.npy'}
+class HFImgLatentDataset(Dataset):
+    """Paired ImageNet images and VAE moments stored as HuggingFace datasets."""
 
-        self.num_classes = num_classes
-        self.features_dir = os.path.join(data_dir, 'vae-sd')
+    PRECOMPUTED = {"sdvae-ft-mse-f8d4"}
 
-
-        # features
-        self._feature_fnames = {
-            os.path.relpath(os.path.join(root, fname), start=self.features_dir)
-            for root, _dirs, files in os.walk(self.features_dir) for fname in files
-            }
-        self.feature_fnames = sorted(
-            fname for fname in self._feature_fnames if self._file_ext(fname) in supported_ext
+    def __init__(self, vae_name, data_dir="/dev/shm/data", split="train"):
+        if load_from_disk is None:
+            raise ImportError(
+                "HFImgLatentDataset requires the 'datasets' package; "
+                "install the repository requirements first"
             )
-        # labels
-        fname = 'dataset.json'
-        with open(os.path.join(self.features_dir, fname), 'rb') as f:
-            labels = json.load(f)['labels']
-        labels = dict(labels)
-        labels = [labels[fname.replace('\\', '/')] for fname in self.feature_fnames]
-        labels = np.array(labels)
-        self.labels = labels.astype({1: np.int64, 2: np.float32}[labels.ndim])
+        if vae_name not in self.PRECOMPUTED:
+            raise ValueError(f"VAE {vae_name} not found in {sorted(self.PRECOMPUTED)}")
 
+        split_dir = "val" if split == "val" else ""
+        image_path = os.path.join(data_dir, "imagenet-latents-images", split_dir)
+        latent_path = os.path.join(
+            data_dir, f"imagenet-latents-{vae_name}", split_dir
+        )
+        self.img_dataset = load_from_disk(image_path)
+        self.latent_dataset = load_from_disk(latent_path)
 
-    def _file_ext(self, fname):
-        return os.path.splitext(fname)[1].lower()
+        if len(self.img_dataset) != len(self.latent_dataset):
+            raise ValueError(
+                "Image and latent dataset lengths differ: "
+                f"images={len(self.img_dataset)}, latents={len(self.latent_dataset)}"
+            )
+        self._require_columns(self.img_dataset, {"image", "label"}, image_path)
+        self._require_columns(self.latent_dataset, {"data"}, latent_path)
 
-    def __len__(self):
-        return len(self.feature_fnames)
+    @staticmethod
+    def _require_columns(dataset, required, path):
+        columns = set(dataset.column_names)
+        missing = required - columns
+        if missing:
+            raise KeyError(f"Dataset {path} is missing columns: {sorted(missing)}")
 
     def __getitem__(self, idx):
-        feature_fname = self.feature_fnames[idx]
-        features = np.load(os.path.join(self.features_dir, feature_fname))
-        return torch.from_numpy(features), torch.tensor(self.labels[idx])
+        image_element = self.img_dataset[idx]
+        latent_element = self.latent_dataset[idx]
+        image = np.asarray(image_element["image"].convert("RGB"), dtype=np.uint8)
+        image = np.ascontiguousarray(image.transpose(2, 0, 1))
+        latent = torch.as_tensor(latent_element["data"])
+        if latent.ndim == 4 and latent.shape[0] == 1:
+            latent = latent.squeeze(0)
+        if latent.ndim != 3 or latent.shape[0] != 8:
+            raise ValueError(
+                "Expected VAE moments with shape [8, H, W] or [1, 8, H, W], "
+                f"got {tuple(latent.shape)} at index {idx}"
+            )
+        label = image_element["label"]
+        return torch.from_numpy(image), latent, torch.tensor(label)
 
+    def __len__(self):
+        return len(self.img_dataset)
 
+    def __repr__(self):
+        return f"HFImgLatentDataset(n={len(self)})"

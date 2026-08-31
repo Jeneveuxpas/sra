@@ -1,0 +1,62 @@
+# SiT-B/2 + SRA with privileged clean DINO CLS conditioning.
+# Original SRA settings follow arXiv:2505.02831; the CLS schedule is new.
+# Usage:
+# accelerate launch --config_file configs/default.yaml train.py \
+#   --config configs/sit-b2-sra-cls.yaml
+
+# Output
+output-dir: exps
+exp-name: sit-b2-sra-privileged-cls-imagenet256
+logging-dir: logs
+resume-ckpt: null
+sample-steps: 100000
+checkpoint-steps: 100000
+checkpoint-epochs: 100
+
+# Model and data
+model: SiT-B/2
+num-classes: 1000
+resolution: 256
+data-dir: /dev/shm/data
+fused-attn: true
+qk-norm: false
+
+# configs/default.yaml launches 8 processes, so 32 per GPU gives the paper's
+# global batch size of 256. Use 64 per GPU when launching on 4 GPUs.
+batch-size: 32
+num-workers: 8
+
+# Optimization: original SiT/SRA ImageNet-256 recipe
+epochs: 100
+max-train-steps: 400000
+mixed-precision: fp16
+gradient-accumulation-steps: 1
+learning-rate: 0.0001
+adam-beta1: 0.9
+adam-beta2: 0.999
+adam-weight-decay: 0.0
+adam-epsilon: 0.00000001
+max-grad-norm: 1.0
+# The paper's table prints 0.999, but its EMA analysis and official code use 0.9999.
+ema-decay: 0.9999
+seed: 0
+
+# Original SiT-B/2 SRA alignment recipe: block 3 -> block 8, dynamic gap
+# [0, 0.2), smooth-L1, and lambda=0.2.
+path-type: linear
+prediction: v
+weighting: uniform
+loss-type: sml1
+block-out-s: 3
+block-out-t: 8
+t-max: 0.2
+align-weight: 0.2
+cfg-prob: 0.1
+
+# Privileged CLS extension. The 100K decay is scaled to the 400K SiT-B run;
+# student CLS probability remains at 0.1 for the final 300K steps.
+dino-model-name: dinov2_vitb14
+cls-dim: 768
+cls-prob-start: 1.0
+cls-prob-end: 0.1
+cls-prob-decay-steps: 100000

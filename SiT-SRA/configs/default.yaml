@@ -1,3 +1,5 @@
+# Accelerate launcher settings only. Training hyperparameters live in
+# configs/sit-b2-sra-cls.yaml and are loaded by train.py --config.
 compute_environment: LOCAL_MACHINE
 debug: false
 distributed_type: MULTI_GPU

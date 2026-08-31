@@ -3,6 +3,7 @@ import copy
 from copy import deepcopy
 import logging
 import os
+import yaml
 import torch
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -20,9 +21,10 @@ from accelerate.utils import ProjectConfiguration, set_seed
 from transformers.optimization import get_scheduler
 
 from models.sit import SiT_models
-from loss import SRALoss
+from loss import SRALoss, linear_cls_probability
 
-from dataset import CustomDataset
+from dataset import HFImgLatentDataset
+from dino_cls import load_dino_cls_extractor
 from diffusers.models import AutoencoderKL
 
 import math
@@ -127,11 +129,24 @@ def main(args):
 
     block_kwargs = {"fused_attn": args.fused_attn, "qk_norm": args.qk_norm}
 
+    dino_cls_extractor = load_dino_cls_extractor(
+        args.dino_model_name,
+        args.resolution,
+        device,
+        accelerator,
+    )
+    if dino_cls_extractor.embed_dim != args.cls_dim:
+        raise ValueError(
+            f"DINO CLS dimension {dino_cls_extractor.embed_dim} does not match "
+            f"--cls-dim={args.cls_dim}"
+        )
 
     model = SiT_models[args.model](
         input_size=latent_size,
         num_classes=args.num_classes,
         use_cfg=(args.cfg_prob > 0),
+        class_dropout_prob=args.cfg_prob,
+        cls_condition_dim=args.cls_dim,
         **block_kwargs
     )
 
@@ -173,7 +188,11 @@ def main(args):
 
 
     # Setup dataset:
-    train_dataset = CustomDataset(args.data_dir_train)
+    train_dataset = HFImgLatentDataset(
+        "sdvae-ft-mse-f8d4",
+        args.data_dir,
+        split="train",
+    )
 
 
     num_images = len(train_dataset)
@@ -191,12 +210,11 @@ def main(args):
     )
 
     if accelerator.is_main_process:
-        logger.info(f"Dataset contains {num_images:,} images ({args.data_dir_train})")
+        logger.info(f"Dataset contains {num_images:,} images ({args.data_dir})")
         logger.info(
             f"Total batch size: {local_batch_size * accelerator.num_processes * args.gradient_accumulation_steps}")
 
     # Prepare models for training:
-    update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
     model.train()  # important! This enables embedding dropout for classifier-free guidance
     ema.eval()  # EMA model should always be in eval mode
 
@@ -207,6 +225,7 @@ def main(args):
         ckpt = torch.load(
             args.resume_ckpt,
             map_location='cpu',
+            weights_only=False,
         )
         model.load_state_dict(ckpt['model'])
         ema.load_state_dict(ckpt['ema'])
@@ -217,6 +236,10 @@ def main(args):
     model, optimizer, train_dataloader = accelerator.prepare(
         model, optimizer, train_dataloader
     )
+    if args.resume_ckpt is None:
+        # DDP synchronizes the online model during prepare; initialize every local
+        # teacher from that synchronized model rather than its process-local seed.
+        update_ema(ema, model, decay=0)
 
     if accelerator.is_main_process:
         logger.info(f"Starting training experiment: {args.exp_name}")
@@ -231,31 +254,33 @@ def main(args):
 
     # Labels to condition the model with (feel free to change):
     sample_batch_size = 64 // accelerator.num_processes
-    gt_xs, _ = next(iter(train_dataloader))
+    _, gt_xs, gt_labels = next(iter(train_dataloader))
     gt_xs = gt_xs[:sample_batch_size]
+    gt_labels = gt_labels[:sample_batch_size]
     gt_xs = sample_posterior(
         gt_xs.to(device), latents_scale=latents_scale, latents_bias=latents_bias
     )
-    ys = torch.randint(1000, size=(sample_batch_size,), device=device)
-    ys = ys.to(device)
+    ys = gt_labels.to(device)
     # Create sampling noise:
     n = ys.size(0)
     xT = torch.randn((n, 4, latent_size, latent_size), device=device)
 
 
+    last_epoch = epoch_start
     for epoch in range(epoch_start+1, args.epochs):
+        last_epoch = epoch
 
         model.train()
-        for images_l, y in train_dataloader:
+        for raw_image, images_l, y in train_dataloader:
             # save checkpoint (feel free to adjust the frequency)
             if (global_step % args.checkpoint_steps == 0) and global_step > 0:
                 accelerator.wait_for_everyone()
                 if accelerator.is_main_process:
                     checkpoint = {
-                        "model": model.module.state_dict(),
+                        "model": accelerator.unwrap_model(model).state_dict(),
                         "ema": ema.state_dict(),
                         "opt": optimizer.state_dict(),
-                        "args": args,
+                        "args": vars(args),
                         "epoch": epoch,
                         "steps": global_step,
                     }
@@ -304,28 +329,34 @@ def main(args):
                     logger.info(f"Saved samples at step {global_step}")
                 model.train()
 
-            x = images_l.squeeze(dim=1).to(device)
+            x = images_l.to(device)
             y = y.to(device)
+            raw_image = raw_image.to(device)
             labels = y
 
             with torch.no_grad():
                 x = sample_posterior(x, latents_scale=latents_scale, latents_bias=latents_bias)
+                with accelerator.autocast():
+                    cls_condition = dino_cls_extractor(raw_image)
 
             with accelerator.accumulate(model):
-                gen_loss, align_loss = loss_fn(model, x, ema, labels)
+                cls_probability = linear_cls_probability(
+                    global_step,
+                    args.cls_prob_start,
+                    args.cls_prob_end,
+                    args.cls_prob_decay_steps,
+                )
+                gen_loss, align_loss, student_cls_present = loss_fn(
+                    model,
+                    x,
+                    ema,
+                    labels,
+                    cls_condition,
+                    cls_probability,
+                )
                 gen_loss_mean = gen_loss.mean()
-
-                # we dynamically adjust the weight of align loss to make two losses at the same scale.
-                if args.resolution == 256:
-                    if args.loss_type == "cos":
-                         align_loss_mean = align_loss.mean() * 0.5
-                    else:
-                        align_loss_mean = align_loss.mean() * 2 * (0.1 ** (((epoch - 149) / 1000 + 1) if epoch > 149 else 1))
-                else:
-                    if args.loss_type == "cos":
-                         align_loss_mean = align_loss.mean() * 0.5
-                    else:
-                        align_loss_mean = align_loss.mean() * 2 * (0.1 ** (((epoch - 99) / 800 + 1) if epoch > 99 else 1))
+                align_loss_raw = align_loss.mean()
+                align_loss_mean = args.align_weight * align_loss_raw
 
                 # total loss
                 loss = gen_loss_mean + align_loss_mean
@@ -339,7 +370,7 @@ def main(args):
                 optimizer.zero_grad(set_to_none=True)
 
                 if accelerator.sync_gradients:
-                    update_ema(ema, model)  # change ema function
+                    update_ema(ema, model, decay=args.ema_decay)
 
             ### enter
             if accelerator.sync_gradients:
@@ -349,6 +380,11 @@ def main(args):
             logs = {
                 "gen_loss": accelerator.gather(gen_loss_mean).mean().detach().item(),
                 "align_loss": accelerator.gather(align_loss_mean).mean().detach().item(),
+                "align_loss_raw": accelerator.gather(align_loss_raw).mean().detach().item(),
+                "cls_probability": cls_probability,
+                "cls_present_rate": accelerator.gather(
+                    student_cls_present.float().mean().unsqueeze(0)
+                ).mean().detach().item(),
                 "epoch": epoch,
             }
             progress_bar.set_postfix(**logs)
@@ -359,10 +395,10 @@ def main(args):
         if (epoch+1) % args.checkpoint_epochs == 0:
             if accelerator.is_main_process:
                 checkpoint = {
-                    "model": model.module.state_dict(),
+                    "model": accelerator.unwrap_model(model).state_dict(),
                     "ema": ema.state_dict(),
                     "opt": optimizer.state_dict(),
-                    "args": args,
+                    "args": vars(args),
                     "epoch": epoch,
                     "steps": global_step,
                 }
@@ -379,6 +415,22 @@ def main(args):
         if global_step >= args.max_train_steps:
             break
 
+    # The periodic step checkpoint runs before each update, so explicitly save
+    # the state that reached max_train_steps (or the last completed epoch).
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        checkpoint = {
+            "model": accelerator.unwrap_model(model).state_dict(),
+            "ema": ema.state_dict(),
+            "opt": optimizer.state_dict(),
+            "args": vars(args),
+            "epoch": last_epoch,
+            "steps": global_step,
+        }
+        checkpoint_path = f"{checkpoint_dir}/step-{global_step}.pt"
+        torch.save(checkpoint, checkpoint_path)
+        logger.info(f"Saved final checkpoint to {checkpoint_path}")
+
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
 
@@ -391,9 +443,16 @@ def main(args):
 def parse_args(input_args=None):
     parser = argparse.ArgumentParser(description="Training")
 
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="YAML file containing training arguments; explicit CLI arguments override it.",
+    )
+
     # logging:
     parser.add_argument("--output-dir", type=str, default="exps")
-    parser.add_argument("--exp-name", type=str, required=True)
+    parser.add_argument("--exp-name", type=str, default=None)
     parser.add_argument("--logging-dir", type=str, default="logs")
     parser.add_argument("--resume-ckpt", type=str, default=None)
     parser.add_argument("--sample-steps", type=int, default=100000)
@@ -409,7 +468,13 @@ def parse_args(input_args=None):
     parser.add_argument("--qk-norm", action=argparse.BooleanOptionalAction, default=False)
 
     # dataset
-    parser.add_argument("--data-dir-train", type=str, default="../data/imagenet256")
+    parser.add_argument(
+        "--data-dir",
+        "--data-dir-train",
+        dest="data_dir",
+        type=str,
+        default="/dev/shm/data",
+    )
     parser.add_argument("--resolution", type=int, choices=[256, 512], default=256)
     parser.add_argument("--batch-size", type=int, default=32)
 
@@ -424,6 +489,8 @@ def parse_args(input_args=None):
     parser.add_argument("--adam-weight-decay", type=float, default=0., help="Weight decay to use.")
     parser.add_argument("--adam-epsilon", type=float, default=1e-08, help="Epsilon value for the Adam optimizer")
     parser.add_argument("--max-grad-norm", default=1.0, type=float, help="Max gradient norm.")
+    parser.add_argument("--ema-decay", default=0.9999, type=float,
+                        help="Fixed EMA decay used to update the privileged teacher.")
 
     # seed
     parser.add_argument("--seed", type=int, default=0)
@@ -441,14 +508,89 @@ def parse_args(input_args=None):
     parser.add_argument("--block-out-t", type=int, default=8)
     parser.add_argument("--t-max", type=float, default=0.2
                         , help="The max time-distance for teacher-student matching.")
+    parser.add_argument("--align-weight", type=float, default=0.5,
+                        help="Single weight applied to SRA alignment for every sample.")
+    parser.add_argument("--cls-dim", type=int, default=768,
+                        help="Dimension of the clean DINO CLS feature.")
+    parser.add_argument("--dino-model-name", type=str, default="dinov2_vitb14",
+                        help="torch.hub DINOv2 model used only during training.")
+    parser.add_argument("--cls-prob-start", type=float, default=1.0,
+                        help="Initial probability that a student sample receives clean CLS.")
+    parser.add_argument("--cls-prob-end", type=float, default=0.1,
+                        help="Student CLS probability after schedule decay.")
+    parser.add_argument("--cls-prob-decay-steps", type=int, default=1_000_000,
+                        help="Number of optimizer steps for linear CLS probability decay.")
+    raw_args = input_args
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument("--config", type=str, default=None)
+    config_args, _ = config_parser.parse_known_args(raw_args)
 
+    if config_args.config is not None:
+        try:
+            with open(config_args.config, encoding="utf-8") as config_file:
+                config = yaml.safe_load(config_file) or {}
+        except (OSError, yaml.YAMLError) as exc:
+            parser.error(f"Could not load config {config_args.config!r}: {exc}")
+        if not isinstance(config, dict):
+            parser.error("The training config must contain a top-level YAML mapping")
 
+        actions_by_destination = {
+            action.dest: action
+            for action in parser._actions
+            if action.dest != "help"
+        }
+        config_defaults = {}
+        for key, value in config.items():
+            if not isinstance(key, str):
+                parser.error(f"Config keys must be strings, got {key!r}")
+            destination = key.replace("-", "_")
+            if destination not in actions_by_destination or destination == "config":
+                parser.error(f"Unknown training config key: {key}")
+            action = actions_by_destination[destination]
+            if isinstance(action, argparse.BooleanOptionalAction):
+                if not isinstance(value, bool):
+                    parser.error(
+                        f"Config value for {key} must be true or false, got {value!r}"
+                    )
+                converted_value = value
+            elif value is None:
+                converted_value = None
+            elif action.type is not None:
+                try:
+                    converted_value = action.type(value)
+                except (TypeError, ValueError) as exc:
+                    parser.error(f"Invalid config value for {key}: {exc}")
+            else:
+                converted_value = value
 
+            if action.choices is not None and converted_value not in action.choices:
+                parser.error(
+                    f"Invalid config value for {key}: {converted_value!r}; "
+                    f"choose from {list(action.choices)}"
+                )
+            config_defaults[destination] = converted_value
+        parser.set_defaults(**config_defaults)
 
-    if input_args is not None:
-        args = parser.parse_args(input_args)
-    else:
-        args = parser.parse_args()
+    args = parser.parse_args(raw_args)
+
+    if not args.exp_name:
+        parser.error("--exp-name must be provided on the CLI or in --config")
+    if args.model not in SiT_models:
+        parser.error(
+            "--model must be one of: " + ", ".join(sorted(SiT_models))
+        )
+    if args.cls_dim <= 0:
+        parser.error("--cls-dim must be positive for privileged CLS training")
+    if not 0 <= args.cls_prob_end <= args.cls_prob_start <= 1:
+        parser.error("CLS probabilities must satisfy 0 <= end <= start <= 1")
+    if args.cls_prob_decay_steps <= 0:
+        parser.error("--cls-prob-decay-steps must be positive")
+    if args.align_weight < 0:
+        parser.error("--align-weight must be non-negative")
+    if not 0 <= args.cfg_prob <= 1:
+        parser.error("--cfg-prob must be in [0, 1]")
+    if not 0 <= args.ema_decay < 1:
+        parser.error("--ema-decay must satisfy 0 <= decay < 1")
 
     return args
 
