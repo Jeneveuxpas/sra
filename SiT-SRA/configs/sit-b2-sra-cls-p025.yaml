@@ -5,6 +5,8 @@
 output-dir: exps
 exp-name: sit-b2-sra-privileged-cls-p025-imagenet256
 logging-dir: logs
+report-to: wandb
+wandb-project: SiT-SRA
 resume-ckpt: null
 sample-steps: 100000
 checkpoint-steps: 100000

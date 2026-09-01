@@ -101,6 +101,7 @@ def main(args):
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
+        log_with=None if args.report_to == "none" else args.report_to,
         project_config=accelerator_project_config,
     )
 
@@ -232,6 +233,18 @@ def main(args):
     model, optimizer, train_dataloader = accelerator.prepare(
         model, optimizer, train_dataloader
     )
+    if args.report_to != "none" and accelerator.is_main_process:
+        tracker_config = vars(copy.deepcopy(args))
+        wandb_init_kwargs = {
+            "name": args.wandb_run_name or args.exp_name,
+        }
+        if args.wandb_entity:
+            wandb_init_kwargs["entity"] = args.wandb_entity
+        accelerator.init_trackers(
+            project_name=args.wandb_project,
+            config=tracker_config,
+            init_kwargs={"wandb": wandb_init_kwargs},
+        )
     if args.resume_ckpt is None:
         # DDP synchronizes the online model during prepare; initialize every local
         # teacher from that synchronized model rather than its process-local seed.
@@ -460,6 +473,13 @@ def parse_args(input_args=None):
     parser.add_argument("--output-dir", type=str, default="exps")
     parser.add_argument("--exp-name", type=str, default=None)
     parser.add_argument("--logging-dir", type=str, default="logs")
+    parser.add_argument(
+        "--report-to", type=str, default="none", choices=["none", "wandb"],
+        help="Experiment tracker. Set to wandb to upload accelerator.log metrics.",
+    )
+    parser.add_argument("--wandb-project", type=str, default="SiT-SRA")
+    parser.add_argument("--wandb-entity", type=str, default=None)
+    parser.add_argument("--wandb-run-name", type=str, default=None)
     parser.add_argument("--resume-ckpt", type=str, default=None)
     parser.add_argument("--sample-steps", type=int, default=100000)
     parser.add_argument("--epochs", type=int, default=801)
