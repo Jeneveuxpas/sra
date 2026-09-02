@@ -9,7 +9,7 @@ from PIL import Image
 
 from dataset import HFImgLatentDataset
 from dino_cls import DINOCLSExtractor
-from loss import SRALoss, linear_cls_probability
+from loss import SRALoss, Simpleloss, linear_cls_probability
 from models.sit import CLSTokenEmbedder, MaskedAttention, SiT
 
 
@@ -35,6 +35,20 @@ class ProbabilityScheduleTest(unittest.TestCase):
         self.assertAlmostEqual(linear_cls_probability(50, 1.0, 0.2, 100), 0.6)
         self.assertEqual(linear_cls_probability(100, 1.0, 0.2, 100), 0.2)
         self.assertEqual(linear_cls_probability(1000, 1.0, 0.2, 100), 0.2)
+
+
+class AlignmentLossTest(unittest.TestCase):
+    def test_cosine_aligns_each_token_over_hidden_dimension(self):
+        student = torch.randn(2, 3, 4)
+        teacher = torch.randn(2, 3, 4)
+
+        actual = Simpleloss()(student, teacher, loss_type="cos")
+        expected = 1 - torch.nn.functional.cosine_similarity(
+            student, teacher, dim=-1
+        )
+
+        self.assertEqual(actual.shape, (2, 3))
+        torch.testing.assert_close(actual, expected)
 
 
 class CLSTokenEmbedderTest(unittest.TestCase):

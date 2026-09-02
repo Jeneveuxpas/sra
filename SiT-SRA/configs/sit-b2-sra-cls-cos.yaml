@@ -1,0 +1,60 @@
+# SiT-B/2 + SRA with privileged clean DINO CLS conditioning.
+# Ablation: cosine feature alignment; all training settings otherwise match
+# the p_end=0.1 Smooth-L1 experiment.
+
+# Output and tracking
+output-dir: exps
+exp-name: sit-b2-sra-privileged-cls-cos-imagenet256
+logging-dir: logs
+report-to: wandb
+wandb-project: SiT-SRA
+resume-ckpt: null
+sample-steps: 100000
+checkpoint-steps: 100000
+checkpoint-epochs: 200
+
+# Model and data
+model: SiT-B/2
+num-classes: 1000
+resolution: 256
+data-dir: /dev/shm/data
+fused-attn: true
+qk-norm: false
+
+# Two GPUs x 128 samples = global batch size 256.
+batch-size: 128
+num-workers: 8
+
+# Optimization
+epochs: 200
+max-train-steps: 400000
+mixed-precision: fp16
+gradient-accumulation-steps: 1
+learning-rate: 0.0001
+adam-beta1: 0.9
+adam-beta2: 0.999
+adam-weight-decay: 0.0
+adam-epsilon: 0.00000001
+max-grad-norm: 1.0
+ema-decay: 0.9999
+seed: 0
+
+# SRA: only loss-type differs from the p_end=0.1 Smooth-L1 run.
+path-type: linear
+prediction: v
+weighting: uniform
+loss-type: cos
+block-out-s: 3
+block-out-t: 8
+t-max: 0.2
+official-sra-schedule: false
+align-weight: 0.2
+cfg-prob: 0.1
+use-privileged-cls: true
+
+# Privileged CLS schedule
+dino-model-name: dinov2_vitb14
+cls-dim: 768
+cls-prob-start: 1.0
+cls-prob-end: 0.1
+cls-prob-decay-steps: 100000
