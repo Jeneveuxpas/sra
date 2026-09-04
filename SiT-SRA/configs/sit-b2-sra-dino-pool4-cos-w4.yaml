@@ -1,0 +1,60 @@
+# SiT-B/2 + SRA with clean DINO CLS + 4x4 pooled patch tokens.
+
+# Output and tracking
+output-dir: exps
+exp-name: sit-b2-sra-dino-pool4-cos-w4-imagenet256
+logging-dir: logs
+report-to: wandb
+wandb-project: SiT-SRA
+resume-ckpt: null
+sample-steps: 100000
+checkpoint-steps: 100000
+checkpoint-epochs: 200
+
+# Model and data
+model: SiT-B/2
+num-classes: 1000
+resolution: 256
+data-dir: /dev/shm/data
+fused-attn: true
+qk-norm: false
+batch-size: 128
+num-workers: 8
+
+# Optimization
+epochs: 200
+max-train-steps: 400000
+mixed-precision: fp16
+gradient-accumulation-steps: 1
+learning-rate: 0.0001
+adam-beta1: 0.9
+adam-beta2: 0.999
+adam-weight-decay: 0.0
+adam-epsilon: 0.00000001
+max-grad-norm: 1.0
+ema-decay: 0.9999
+seed: 0
+
+# SRA settings inherited from the best CLS-token run.
+path-type: linear
+prediction: v
+weighting: uniform
+loss-type: cos
+block-out-s: 3
+block-out-t: 8
+t-max: 0.2
+official-sra-schedule: false
+align-weight: 4.0
+cfg-prob: 0.1
+use-privileged-cls: true
+
+# DINOv2-B/14: 224x224 input -> 16x16 patch grid -> 4x4 pooled grid.
+# The privileged prefix contains 1 CLS + 16 pooled patch tokens.
+dino-model-name: dinov2_vitb14
+cls-dim: 768
+dino-include-cls: true
+dino-pool-size: 4
+cls-clean-timestep: true
+cls-prob-start: 1.0
+cls-prob-end: 0.1
+cls-prob-decay-steps: 100000

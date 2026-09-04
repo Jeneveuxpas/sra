@@ -110,13 +110,61 @@ class LabelEmbedder(nn.Module):
 
 
 class CLSTokenEmbedder(nn.Module):
-    """Projects a clean CLS feature into the reserved first sequence-token slot."""
+    """Projects DINO features and adds fixed positions to privileged tokens."""
 
-    def __init__(self, input_dim, hidden_size):
+    def __init__(
+            self,
+            input_dim,
+            hidden_size,
+            num_tokens=1,
+            has_cls_token=True,
+            target_grid_size=None,
+    ):
         super().__init__()
         self.input_dim = input_dim
+        self.num_tokens = num_tokens
+        self.has_cls_token = has_cls_token
+        if num_tokens <= 0:
+            raise ValueError(f"num_tokens must be positive, got {num_tokens}")
         self.projection = nn.Linear(input_dim, hidden_size)
         self.norm = nn.LayerNorm(hidden_size)
+
+        # Match REG for the global CLS slot (zero position). Pooled DINO patch
+        # positions are expressed in the same coordinate system as the SiT
+        # latent-token grid. A pooled cell is placed at the center of the SiT
+        # cells it covers, following the scaled-reference idea used by ControlSFT.
+        num_spatial_tokens = num_tokens - int(has_cls_token)
+        if num_spatial_tokens:
+            grid_size = int(num_spatial_tokens ** 0.5)
+            if grid_size * grid_size != num_spatial_tokens:
+                raise ValueError(
+                    "The number of pooled DINO patch tokens must form a square "
+                    f"grid, got {num_spatial_tokens}"
+                )
+            if target_grid_size is None:
+                target_grid_size = grid_size
+            if target_grid_size <= 0:
+                raise ValueError(
+                    f"target_grid_size must be positive, got {target_grid_size}"
+                )
+            scale = target_grid_size / grid_size
+            coords = (np.arange(grid_size, dtype=np.float32) + 0.5) * scale - 0.5
+            grid = np.meshgrid(coords, coords)
+            grid = np.stack(grid, axis=0).reshape(2, 1, grid_size, grid_size)
+            spatial_pos = get_2d_sincos_pos_embed_from_grid(hidden_size, grid)
+            if has_cls_token:
+                privileged_pos = np.concatenate(
+                    [np.zeros((1, hidden_size), dtype=np.float32), spatial_pos], axis=0
+                )
+            else:
+                privileged_pos = spatial_pos
+        else:
+            privileged_pos = np.zeros((1, hidden_size), dtype=np.float32)
+        self.register_buffer(
+            "pos_embed",
+            torch.from_numpy(privileged_pos).float().unsqueeze(0),
+            persistent=False,
+        )
 
     def forward(self, cls_condition, batch_size, device, dtype):
         """Return a projected CLS token, or a masked-safe placeholder for sampling."""
@@ -124,27 +172,34 @@ class CLSTokenEmbedder(nn.Module):
             # Training-preview sampling has no clean source image.  SiT.forward
             # pairs this placeholder with cls_present=False, so it is never a
             # visible attention key/value and cannot affect image tokens.
-            return torch.zeros(
-                batch_size,
-                self.projection.out_features,
-                device=device,
-                dtype=dtype,
-            )
+            shape = (batch_size, self.projection.out_features)
+            if self.num_tokens > 1:
+                shape = (batch_size, self.num_tokens, self.projection.out_features)
+            return torch.zeros(*shape, device=device, dtype=dtype)
 
-        if cls_condition.ndim == 3 and cls_condition.shape[1] == 1:
+        if cls_condition.ndim == 3 and cls_condition.shape[1] == 1 and self.num_tokens == 1:
             cls_condition = cls_condition[:, 0]
-        if cls_condition.ndim != 2:
+        expected_shape = (
+            (batch_size, self.input_dim)
+            if self.num_tokens == 1
+            else (batch_size, self.num_tokens, self.input_dim)
+        )
+        if cls_condition.ndim not in (2, 3):
             raise ValueError(
-                f"cls_condition must have shape [B, {self.input_dim}], got {tuple(cls_condition.shape)}"
+                "cls_condition must contain a batch of DINO feature tokens, "
+                f"got {tuple(cls_condition.shape)}"
             )
-        if cls_condition.shape != (batch_size, self.input_dim):
+        if tuple(cls_condition.shape) != expected_shape:
             raise ValueError(
-                f"cls_condition must have shape [{batch_size}, {self.input_dim}], "
+                f"cls_condition must have shape {expected_shape}, "
                 f"got {tuple(cls_condition.shape)}"
             )
 
         cls_condition = cls_condition.to(device=device, dtype=dtype)
-        return self.norm(self.projection(cls_condition))
+        tokens = self.norm(self.projection(cls_condition))
+        if tokens.ndim == 2:
+            return tokens + self.pos_embed[:, 0].to(device=device, dtype=dtype)
+        return tokens + self.pos_embed.to(device=device, dtype=dtype)
 
 
 #################################################################################
@@ -217,17 +272,83 @@ class SiTBlock(nn.Module):
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         )
 
-    def forward(self, x, c, key_mask=None):
+    def forward(self, x, c, key_mask=None, prefix_c=None, num_prefix_tokens=0):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.adaLN_modulation(c).chunk(6, dim=-1)
         )
-        attn_input = modulate(self.norm1(x), shift_msa, scale_msa)
+        if prefix_c is None:
+            attn_input = modulate(self.norm1(x), shift_msa, scale_msa)
+            gate_msa_tokens = gate_msa.unsqueeze(1)
+            gate_mlp_tokens = gate_mlp.unsqueeze(1)
+            prefix_modulation = None
+        else:
+            if not 0 < num_prefix_tokens < x.shape[1]:
+                raise ValueError(
+                    "num_prefix_tokens must split a non-empty prefix from image tokens, "
+                    f"got {num_prefix_tokens} for sequence length {x.shape[1]}"
+                )
+            prefix_modulation = self.adaLN_modulation(prefix_c).chunk(6, dim=-1)
+            (
+                prefix_shift_msa,
+                prefix_scale_msa,
+                prefix_gate_msa,
+                _,
+                _,
+                prefix_gate_mlp,
+            ) = prefix_modulation
+            normed = self.norm1(x)
+            attn_input = torch.cat(
+                [
+                    modulate(
+                        normed[:, :num_prefix_tokens],
+                        prefix_shift_msa,
+                        prefix_scale_msa,
+                    ),
+                    modulate(
+                        normed[:, num_prefix_tokens:], shift_msa, scale_msa
+                    ),
+                ],
+                dim=1,
+            )
+            gate_msa_tokens = torch.cat(
+                [
+                    prefix_gate_msa.unsqueeze(1).expand(-1, num_prefix_tokens, -1),
+                    gate_msa.unsqueeze(1).expand(-1, x.shape[1] - num_prefix_tokens, -1),
+                ],
+                dim=1,
+            )
+            gate_mlp_tokens = torch.cat(
+                [
+                    prefix_gate_mlp.unsqueeze(1).expand(-1, num_prefix_tokens, -1),
+                    gate_mlp.unsqueeze(1).expand(-1, x.shape[1] - num_prefix_tokens, -1),
+                ],
+                dim=1,
+            )
         if self.use_token_mask:
             attn_output = self.attn(attn_input, key_mask=key_mask)
         else:
             attn_output = self.attn(attn_input)
-        x = x + gate_msa.unsqueeze(1) * attn_output
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        x = x + gate_msa_tokens * attn_output
+
+        normed = self.norm2(x)
+        if prefix_modulation is None:
+            mlp_input = modulate(normed, shift_mlp, scale_mlp)
+        else:
+            prefix_shift_mlp, prefix_scale_mlp = prefix_modulation[3:5]
+            mlp_input = torch.cat(
+                [
+                    modulate(
+                        normed[:, :num_prefix_tokens],
+                        prefix_shift_mlp,
+                        prefix_scale_mlp,
+                    ),
+                    modulate(
+                        normed[:, num_prefix_tokens:], shift_mlp, scale_mlp
+                    ),
+                ],
+                dim=1,
+            )
+        x = x + gate_mlp_tokens * self.mlp(mlp_input)
 
         return x
 
@@ -274,6 +395,9 @@ class SiT(nn.Module):
             num_classes=1000,
             use_cfg=False,
             cls_condition_dim=0,
+            cls_condition_num_tokens=1,
+            cls_condition_has_cls=True,
+            cls_condition_clean_timestep=False,
             **block_kwargs  # fused_attn
     ):
         super().__init__()
@@ -285,21 +409,37 @@ class SiT(nn.Module):
         self.use_cfg = use_cfg
         self.num_classes = num_classes
         self.cls_condition_dim = cls_condition_dim
+        self.cls_condition_num_tokens = cls_condition_num_tokens
+        self.cls_condition_has_cls = cls_condition_has_cls
+        self.cls_condition_clean_timestep = cls_condition_clean_timestep
 
         if cls_condition_dim < 0:
             raise ValueError(f"cls_condition_dim must be non-negative, got {cls_condition_dim}")
+        if cls_condition_num_tokens <= 0:
+            raise ValueError(
+                f"cls_condition_num_tokens must be positive, got {cls_condition_num_tokens}"
+            )
 
 
         self.x_embedder = PatchEmbed(
             input_size, patch_size, in_channels, hidden_size, bias=True
         )
+        num_patches = self.x_embedder.num_patches
+        image_token_grid_size = int(num_patches ** 0.5)
+        if image_token_grid_size * image_token_grid_size != num_patches:
+            raise ValueError(f"SiT image-token grid must be square, got {num_patches} tokens")
         self.t_embedder = TimestepEmbedder(hidden_size)  # timestep embedding type
         self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
         self.cls_token_embedder = (
-            CLSTokenEmbedder(cls_condition_dim, hidden_size)
+            CLSTokenEmbedder(
+                cls_condition_dim,
+                hidden_size,
+                num_tokens=cls_condition_num_tokens,
+                has_cls_token=cls_condition_has_cls,
+                target_grid_size=image_token_grid_size,
+            )
             if cls_condition_dim > 0 else None
         )
-        num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
@@ -374,9 +514,10 @@ class SiT(nn.Module):
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
         ad: number of layers to use for self-alignment
-        cls_condition: optional clean image CLS features with shape (N, D)
+        cls_condition: optional clean DINO features with shape (N, D) for the
+            legacy CLS-only path or (N, K, D) for pooled spatial tokens
         cls_present: optional per-sample bool mask controlling whether image
-            patches may attend to the first CLS token during training.
+            patches may attend to the privileged prefix tokens during training.
         """
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
 
@@ -385,15 +526,26 @@ class SiT(nn.Module):
         y, labels_train = self.y_embedder(y, self.training)  # (N, D)
         c = t_embed + y  # (N, D)
         key_mask = None
+        prefix_c = None
+        num_privileged_tokens = 0
         if self.cls_token_embedder is not None:
+            # Optionally treat DINO as a clean condition at the t=0 endpoint;
+            # image tokens always continue to use their sampled diffusion time.
+            prefix_c = (
+                self.t_embedder(torch.zeros_like(t)) + y
+                if self.cls_condition_clean_timestep else c
+            )
             cls_is_missing = cls_condition is None
-            cls_token = self.cls_token_embedder(
+            cls_tokens = self.cls_token_embedder(
                 cls_condition,
                 batch_size=x.shape[0],
                 device=c.device,
                 dtype=c.dtype,
             )
-            x = torch.cat([cls_token.unsqueeze(1), x], dim=1)
+            if cls_tokens.ndim == 2:
+                cls_tokens = cls_tokens.unsqueeze(1)
+            num_privileged_tokens = cls_tokens.shape[1]
+            x = torch.cat([cls_tokens, x], dim=1)
             if cls_present is None:
                 # No source image means no CLS information.  Keep its reserved
                 # token slot fully invisible for training-preview sampling.
@@ -413,25 +565,34 @@ class SiT(nn.Module):
                 raise ValueError("cls_present cannot be true when cls_condition is None")
 
             # Shape [B, 1, 1, T] broadcasts across attention heads and query
-            # tokens. For cls-off samples, no token can read token 0; in
-            # particular, image patches cannot read its key/value.
+            # tokens. For CLS-off samples, no token can read any privileged
+            # prefix key/value.
             key_mask = torch.zeros(x.shape[0], 1, 1, x.shape[1], device=x.device, dtype=x.dtype)
-            key_mask[~cls_present, :, :, 0] = float("-inf")
+            key_mask[~cls_present, :, :, :num_privileged_tokens] = float("-inf")
         elif cls_condition is not None or cls_present is not None:
             raise ValueError("CLS conditioning is disabled because cls_condition_dim is 0")
 
         for i, block in enumerate(self.blocks):
-            x = block(x, c, key_mask=key_mask)
+            x = block(
+                x,
+                c,
+                key_mask=key_mask,
+                prefix_c=prefix_c,
+                num_prefix_tokens=num_privileged_tokens,
+            )
             if (i + 1) == ad:
-                # SRA aligns image representations only; the extra CLS/null
-                # token participates in attention but is never an alignment target.
-                image_tokens = x[:, 1:] if self.cls_token_embedder is not None else x
+                # SRA aligns image representations only; privileged prefix
+                # tokens participate in attention but are never alignment targets.
+                image_tokens = (
+                    x[:, self.cls_condition_num_tokens:]
+                    if self.cls_token_embedder is not None else x
+                )
                 if self.training:
                     xr = self.ap_head(image_tokens)
                 else:
                     xr = image_tokens
         if self.cls_token_embedder is not None:
-            x = x[:, 1:]
+            x = x[:, self.cls_condition_num_tokens:]
         x = self.final_layer(x, c)  # (N, T, patch_size ** 2 * out_channels)
         x = self.unpatchify(x)  # (N, out_channels, H, W)
 

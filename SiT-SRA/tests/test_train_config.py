@@ -28,10 +28,25 @@ class TrainConfigTest(unittest.TestCase):
         self.assertEqual(args.loss_type, "sml1")
         self.assertEqual(args.align_weight, 0.2)
         self.assertEqual(args.max_train_steps, 400_000)
-        self.assertEqual(args.batch_size * 8, 256)
+        self.assertEqual(args.batch_size * 2, 256)
         self.assertEqual(args.ema_decay, 0.9999)
         self.assertEqual(args.data_dir, "/dev/shm/data")
         self.assertEqual(args.cls_prob_decay_steps, 100_000)
+
+    def test_loads_pooled_dino_token_configs(self):
+        config_dir = self.config_path.parent
+        for pool_size in (4, 8):
+            with self.subTest(pool_size=pool_size):
+                args = parse_args([
+                    "--config",
+                    str(config_dir / f"sit-b2-sra-dino-pool{pool_size}-cos-w4.yaml"),
+                ])
+                self.assertTrue(args.use_privileged_cls)
+                self.assertTrue(args.dino_include_cls)
+                self.assertEqual(args.dino_pool_size, pool_size)
+                self.assertTrue(args.cls_clean_timestep)
+                self.assertEqual(args.loss_type, "cos")
+                self.assertEqual(args.align_weight, 4.0)
 
     def test_explicit_cli_arguments_override_yaml(self):
         args = parse_args(

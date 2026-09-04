@@ -10,7 +10,12 @@ from PIL import Image
 from dataset import HFImgLatentDataset
 from dino_cls import DINOCLSExtractor
 from loss import SRALoss, Simpleloss, linear_cls_probability
-from models.sit import CLSTokenEmbedder, MaskedAttention, SiT
+from models.sit import (
+    CLSTokenEmbedder,
+    MaskedAttention,
+    SiT,
+    get_2d_sincos_pos_embed_from_grid,
+)
 
 
 class RecordingModel(nn.Module):
@@ -146,6 +151,65 @@ class CLSTokenEmbedderTest(unittest.TestCase):
 
         for cls_off_value, original_value in zip(cls_off, original):
             torch.testing.assert_close(cls_off_value, original_value, rtol=1e-5, atol=1e-6)
+
+    def test_multiple_privileged_tokens_are_fully_invisible_when_off(self):
+        common = dict(
+            input_size=4,
+            patch_size=2,
+            hidden_size=32,
+            decoder_hidden_size=32,
+            depth=2,
+            num_heads=4,
+            qk_norm=False,
+            fused_attn=False,
+        )
+        privileged_model = SiT(
+            cls_condition_dim=6, cls_condition_num_tokens=5, **common
+        ).eval()
+        original_sit = SiT(cls_condition_dim=0, **common).eval()
+        original_sit.load_state_dict(
+            {
+                key: value
+                for key, value in privileged_model.state_dict().items()
+                if not key.startswith("cls_token_embedder.")
+            },
+            strict=True,
+        )
+        images = torch.randn(2, 4, 4, 4)
+        timesteps = torch.rand(2)
+        labels = torch.tensor([1, 2])
+
+        privileged_off = privileged_model(images, timesteps, labels, ad=1)
+        original = original_sit(images, timesteps, labels, ad=1)
+
+        for privileged_value, original_value in zip(privileged_off, original):
+            torch.testing.assert_close(
+                privileged_value, original_value, rtol=1e-5, atol=1e-6
+            )
+
+    def test_pooled_tokens_get_spatial_positions_but_cls_position_is_zero(self):
+        embedder = CLSTokenEmbedder(
+            input_dim=6,
+            hidden_size=32,
+            num_tokens=5,
+            has_cls_token=True,
+            target_grid_size=4,
+        )
+        self.assertEqual(tuple(embedder.pos_embed.shape), (1, 5, 32))
+        torch.testing.assert_close(
+            embedder.pos_embed[:, 0], torch.zeros_like(embedder.pos_embed[:, 0])
+        )
+        self.assertGreater(embedder.pos_embed[:, 1:].abs().sum().item(), 0)
+
+        # A 2x2 pooled grid over a 4x4 SiT grid uses cell-center coordinates
+        # [0.5, 2.5] on both axes, rather than the unscaled [0, 1].
+        coords = np.array([0.5, 2.5], dtype=np.float32)
+        grid = np.stack(np.meshgrid(coords, coords), axis=0).reshape(2, 1, 2, 2)
+        expected = get_2d_sincos_pos_embed_from_grid(32, grid)
+        torch.testing.assert_close(
+            embedder.pos_embed[:, 1:],
+            torch.from_numpy(expected).float().unsqueeze(0),
+        )
 
     def test_masked_cls_is_invisible_to_patch_attention(self):
         attention = MaskedAttention(
@@ -307,10 +371,14 @@ class RecordingDINO(nn.Module):
 
     def forward_features(self, images):
         self.last_input = images.detach().clone()
+        patch_values = torch.arange(
+            16 * 16 * self.embed_dim, device=images.device, dtype=images.dtype
+        ).reshape(1, 16 * 16, self.embed_dim)
         return {
             "x_norm_clstoken": torch.ones(
                 images.shape[0], self.embed_dim, device=images.device
-            )
+            ),
+            "x_norm_patchtokens": patch_values.repeat(images.shape[0], 1, 1),
         }
 
 
@@ -327,6 +395,23 @@ class DINOCLSExtractorTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(backbone.last_input).all())
         self.assertFalse(backbone.weight.requires_grad)
         self.assertFalse(cls_condition.requires_grad)
+
+    def test_extracts_cls_and_spatially_pooled_patch_tokens(self):
+        raw_images = torch.randint(0, 256, (2, 3, 256, 256), dtype=torch.uint8)
+
+        for pool_size in (4, 8):
+            with self.subTest(pool_size=pool_size):
+                extractor = DINOCLSExtractor(
+                    RecordingDINO(), resolution=256,
+                    pool_size=pool_size, include_cls=True,
+                )
+                condition = extractor(raw_images)
+
+                self.assertEqual(
+                    condition.shape, (2, 1 + pool_size ** 2, 6)
+                )
+                torch.testing.assert_close(condition[:, 0], torch.ones(2, 6))
+                self.assertFalse(condition.requires_grad)
 
 
 if __name__ == "__main__":

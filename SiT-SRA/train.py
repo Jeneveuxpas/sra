@@ -131,13 +131,20 @@ def main(args):
     block_kwargs = {"fused_attn": args.fused_attn, "qk_norm": args.qk_norm}
 
     dino_cls_extractor = None
+    cls_condition_num_tokens = 1
     if args.use_privileged_cls:
         dino_cls_extractor = load_dino_cls_extractor(
-            args.dino_model_name, args.resolution, device, accelerator,
+            args.dino_model_name,
+            args.resolution,
+            device,
+            accelerator,
+            pool_size=args.dino_pool_size,
+            include_cls=args.dino_include_cls,
         )
+        cls_condition_num_tokens = dino_cls_extractor.num_condition_tokens
         if dino_cls_extractor.embed_dim != args.cls_dim:
             raise ValueError(
-                f"DINO CLS dimension {dino_cls_extractor.embed_dim} does not match "
+                f"DINO feature dimension {dino_cls_extractor.embed_dim} does not match "
                 f"--cls-dim={args.cls_dim}"
             )
 
@@ -147,6 +154,9 @@ def main(args):
         use_cfg=(args.cfg_prob > 0),
         class_dropout_prob=args.cfg_prob,
         cls_condition_dim=args.cls_dim if args.use_privileged_cls else 0,
+        cls_condition_num_tokens=cls_condition_num_tokens,
+        cls_condition_has_cls=args.dino_include_cls,
+        cls_condition_clean_timestep=args.cls_clean_timestep,
         **block_kwargs
     )
 
@@ -546,6 +556,18 @@ def parse_args(input_args=None):
                         help="Dimension of the clean DINO CLS feature.")
     parser.add_argument("--dino-model-name", type=str, default="dinov2_vitb14",
                         help="torch.hub DINOv2 model used only during training.")
+    parser.add_argument(
+        "--dino-pool-size", type=int, default=0,
+        help="Spatial side length for adaptive pooling of DINO patch tokens; 0 keeps CLS only.",
+    )
+    parser.add_argument(
+        "--dino-include-cls", action=argparse.BooleanOptionalAction, default=True,
+        help="Prepend the DINO CLS token in addition to pooled patch tokens.",
+    )
+    parser.add_argument(
+        "--cls-clean-timestep", action=argparse.BooleanOptionalAction, default=False,
+        help="Modulate privileged DINO tokens at the clean t=0 endpoint.",
+    )
     parser.add_argument("--cls-prob-start", type=float, default=1.0,
                         help="Initial probability that a student sample receives clean CLS.")
     parser.add_argument("--cls-prob-end", type=float, default=0.1,
@@ -613,6 +635,10 @@ def parse_args(input_args=None):
         )
     if args.use_privileged_cls and args.cls_dim <= 0:
         parser.error("--cls-dim must be positive for privileged CLS training")
+    if args.use_privileged_cls and args.dino_pool_size < 0:
+        parser.error("--dino-pool-size must be non-negative")
+    if args.use_privileged_cls and args.dino_pool_size == 0 and not args.dino_include_cls:
+        parser.error("CLS-disabled pooling requires --dino-pool-size > 0")
     if args.use_privileged_cls and not 0 <= args.cls_prob_end <= args.cls_prob_start <= 1:
         parser.error("CLS probabilities must satisfy 0 <= end <= start <= 1")
     if args.use_privileged_cls and args.cls_prob_decay_steps <= 0:
